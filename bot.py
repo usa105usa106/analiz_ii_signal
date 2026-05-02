@@ -30,7 +30,7 @@ try:
 except Exception:  # Railway всё равно поставит psutil из requirements.txt
     psutil = None
 
-VERSION = "0.08"
+VERSION = "0.12"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен")
@@ -51,6 +51,13 @@ MAX_SIGNAL_SCAN = int(os.getenv("MAX_SIGNAL_SCAN", "500"))
 MAX_ONE_SIGNAL_CHARTS = int(os.getenv("MAX_ONE_SIGNAL_CHARTS", "40"))
 SCAN_PROGRESS_EVERY = int(os.getenv("SCAN_PROGRESS_EVERY", "50"))
 SUPER_ALERT_COOLDOWN_SECONDS = int(os.getenv("SUPER_ALERT_COOLDOWN_SECONDS", "1800"))
+NEWS_REFRESH_SECONDS = int(os.getenv("NEWS_REFRESH_SECONDS", "900"))
+NEWS_SIGNAL_REFRESH_SECONDS = int(os.getenv("NEWS_SIGNAL_REFRESH_SECONDS", "300"))
+NEWS_CACHE_LIMIT = int(os.getenv("NEWS_CACHE_LIMIT", "60"))
+# Срок действия новостей в сигналах:
+# 0–3 часа — полное влияние; 3–6 часов — половинное; старше 6 часов — не учитываются.
+NEWS_STRONG_SECONDS = int(os.getenv("NEWS_STRONG_SECONDS", str(3 * 60 * 60)))
+NEWS_EXPIRE_SECONDS = int(os.getenv("NEWS_EXPIRE_SECONDS", str(6 * 60 * 60)))
 MSK_OFFSET = 3
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -61,6 +68,8 @@ TF_LIST = ["15m", "1h", "4h", "1d", "1w"]
 TF_PAIRS = [("15m", "1h"), ("15m", "4h"), ("1h", "4h"), ("4h", "1d"), ("1d", "1w")]
 ANALYSIS_MODES = ["multi", "best", "max_profit", "auto_ai"]
 INTERNAL_PROFILES = ["trend", "momentum", "breakout", "mean_reversion"]
+SIGNAL_THRESHOLDS = [60, 70, 75, 80, 85, 90, 95]
+STABLE_BASES = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "PYUSD", "USDE", "USD1", "EURC", "EURS"}
 
 DEFAULT_STATE: Dict[str, Any] = {
     "exchange": "mexc",
@@ -71,6 +80,13 @@ DEFAULT_STATE: Dict[str, Any] = {
     "autotrade": False,
     "adaptive_improvement": False,
     "news_enabled": False,
+    "news_cache": [],
+    "news_cache_times": {},
+    "news_seen": [],
+    "news_last_update": 0,
+    "news_bias_value": 0,
+    "news_bias_label": "нейтральный",
+    "news_bias_delta_pct": 0.0,
     "take_enabled": True,
     "take_min_profit_pct": 0.3,
     "take_max_profit_pct": 3.0,
@@ -87,6 +103,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "admin_id": None,
     "price_count": 10,
     "super_trade_enabled": False,
+    "signal_threshold_pct": 60,
     "last_super_alerts": {},
 }
 
@@ -320,18 +337,20 @@ def onoff(v: bool) -> str:
 def main_keyboard() -> types.ReplyKeyboardMarkup:
     s = load_state()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    mode_label = {"all": "all signal", "one": "one signal", "top10": "10 signal"}.get(s.get("signal_output_mode", "all"), "all signal")
+    threshold = int(s.get("signal_threshold_pct", 60))
     kb.add("📡 Signal", "⚙️ Настройки")
     kb.add("📈 MEXC top+", "📈 BINGX top+")
     kb.add(f"🏦 Биржа: {s['exchange'].upper()}", f"⏱ TF {s['lower_tf']}/{s['higher_tf']}")
     kb.add(f"📰 Новости {onoff(s['news_enabled'])}", f"🤖 Генератор: {s['analysis_mode']}")
     kb.add(f"🧠 Улучшения {onoff(s['adaptive_improvement'])}", f"💼 Сделки: {s['daily_trades_limit']}/сут")
     kb.add(f"🌏 Азия {onoff(s['session_asia'])}", f"🇺🇸 Америка {onoff(s['session_america'])}")
-    kb.add(f"🎯 Тейк {onoff(s['take_enabled'])}", f"⚡ Автоторговля {onoff(s['autotrade'])}")
+    kb.add(f"🎯 Тейк макс {onoff(s['take_enabled'])}", f"⚡ Автоторговля {onoff(s['autotrade'])}")
     kb.add(f"🚨 Супер сделка {onoff(s.get('super_trade_enabled', False))}", f"💲 Цена top-{s.get('price_count', 10)}")
-    kb.add(f"📨 {'all signal' if s['signal_output_mode']=='all' else 'one signal'}", "📊 Профит")
-    kb.add("🔑 API ключи", "⛔ Закрыть всё")
-    kb.add("🏓 Ping", "♻️ Сброс")
-    kb.add("🗑 delete all")
+    kb.add(f"📨 {mode_label}", f"🎚 Порог {threshold}%")
+    kb.add("📊 Профит", "🔑 API ключи")
+    kb.add("⛔ Закрыть всё", "🏓 Ping")
+    kb.add("♻️ Сброс", "🗑 delete all")
     return kb
 
 
@@ -342,12 +361,13 @@ def settings_text() -> str:
         f"Биржа: <b>{esc(s['exchange'])}</b>\n"
         f"Монет: <b>{len(s['symbols'])}</b>\n"
         f"TF: <b>{esc(s['lower_tf'])}</b> / <b>{esc(s['higher_tf'])}</b>\n"
-        f"Режим сигналов: <b>{'all signal — кратко одним сообщением' if s['signal_output_mode']=='all' else 'one signal — подробно отдельными сообщениями'}</b>\n"
+        f"Режим сигналов: <b>{ {'all': 'all signal — кратко одним сообщением', 'one': 'one signal — подробно отдельными сообщениями', 'top10': '10 signal — только 10 лучших'}.get(s.get('signal_output_mode', 'all')) }</b>\n"
+        f"Порог сигнала: <b>{int(s.get('signal_threshold_pct', 60))}%</b>\n"
         f"Автосигналы: <b>{'ВКЛ' if s['auto_signals'] else 'ВЫКЛ'}</b>\n"
         f"Автоторговля: <b>{'ВКЛ' if s['autotrade'] else 'ВЫКЛ'}</b> ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'})\n"
         f"Супер сделка: <b>{'ВКЛ' if s.get('super_trade_enabled') else 'ВЫКЛ'}</b>\n"
         f"Улучшения: <b>{'ВКЛ' if s['adaptive_improvement'] else 'ВЫКЛ'}</b>\n"
-        f"Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b>\n"
+        f"Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b> | фон: <b>{esc(s.get('news_bias_label', 'нейтральный'))}</b> ({float(s.get('news_bias_delta_pct') or 0):+.1f}%)\n"
         f"Тейк: <b>{'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}</b>, user range {s['take_min_profit_pct']}% / {s['take_max_profit_pct']}%, TF auto: {'ВКЛ' if s.get('take_auto_by_tf') else 'ВЫКЛ'}\n"
         f"Анализ: <b>{esc(s['analysis_mode'])}</b>, профиль: <b>{esc(s['strategy_profile'])}</b>\n"
         f"Сделок/сутки: <b>{s['daily_trades_limit']}</b>, сегодня: <b>{s['daily_trades_count']}</b>\n"
@@ -362,7 +382,7 @@ def settings_text() -> str:
         "<code>new sol</code> / <code>delete sol</code> / <code>delete all</code>\n"
         "<code>tf 15m 4h</code> / <code>take 0.5 4</code> / <code>trades 10</code>\n"
         "<code>price top-10</code> / <code>price 3</code>\n"
-        "<code>all signal</code> / <code>one signal</code>\n"
+        "<code>all signal</code> / <code>one signal</code> / <code>10 signal</code>\n<code>threshold 70</code> / кнопка Порог\n"
         "<code>auto on</code> / <code>auto off</code>\n"
         "<code>api mexc</code> / <code>api bingx</code> / <code>api status</code>"
     )
@@ -527,12 +547,13 @@ def features(o: Dict[str, np.ndarray]) -> Dict[str, float]:
     }
 
 
-def fetch_crypto_news(limit: int = 8) -> List[str]:
-    """Русскоязычные источники + fallback. Без API-ключей."""
+def fetch_crypto_news(limit: int = 20) -> List[str]:
+    """Русскоязычные и крупные крипто-источники. Без API-ключей."""
     urls = [
         "https://forklog.com/feed",
         "https://bits.media/rss/",
         "https://cointelegraph.com/rss/tag/bitcoin",
+        "https://cointelegraph.com/rss",
     ]
     out: List[str] = []
     for url in urls:
@@ -544,18 +565,244 @@ def fetch_crypto_news(limit: int = 8) -> List[str]:
             for a, b in titles:
                 t = re.sub(r"\s+", " ", (a or b).strip())
                 t = re.sub(r"<.*?>", "", t)
-                if t and not any(x.lower() == t.lower() for x in out) and "RSS" not in t:
+                t = html.unescape(t)
+                if not t or "RSS" in t or "Cointelegraph.com News" in t:
+                    continue
+                if not any(normalize_news_title(x) == normalize_news_title(t) for x in out):
                     out.append(t)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"news source error {url}: {e}", flush=True)
     return out[:limit]
 
 
+def normalize_news_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", str(title or "").strip().lower())
+    title = re.sub(r"[^a-zа-я0-9%$ ]+", "", title)
+    return title[:220]
+
+
+def news_freshness_weight(ts: float, now: Optional[float] = None) -> float:
+    """0–3ч = 1.0, 3–6ч = 0.5, старше 6ч = 0.0."""
+    now = time.time() if now is None else now
+    if not ts:
+        return 0.0
+    age = max(0.0, now - float(ts))
+    if age <= NEWS_STRONG_SECONDS:
+        return 1.0
+    if age <= NEWS_EXPIRE_SECONDS:
+        return 0.5
+    return 0.0
+
+
+def format_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    if h:
+        return f"{h}ч {m}м"
+    return f"{m}м"
+
+
+def analyze_news_background(headlines: List[str], item_times: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """
+    Возвращает общий новостной фон.
+    Если переданы item_times, новости имеют срок действия:
+    0–3 часа — полное влияние; 3–6 часов — половина; старше 6 часов — только в списке, но не в расчёте сигнала.
+    delta_pct — на сколько процентов модель может сдвинуть расчётную успешность.
+    Плюс помогает LONG, минус помогает SHORT. Это оценка, не гарантия.
+    """
+    positive_words = [
+        "рост", "раст", "быч", "позитив", "одобр", "запуск", "принял", "легализ", "институцион",
+        "etf", "rally", "surge", "pump", "bull", "bullish", "adoption", "approve", "approval",
+        "record", "inflow", "buy", "покуп", "снижен", "rate cut", "blackrock", "накоп",
+    ]
+    negative_words = [
+        "паден", "обвал", "дамп", "медвеж", "негатив", "взлом", "хак", "эксплойт", "ликвидац",
+        "запрет", "иск", "штраф", "расслед", "банкрот", "отток", "распрод", "войн", "санкц",
+        "hack", "exploit", "ban", "lawsuit", "sec sues", "crackdown", "selloff", "dump", "liquidation",
+        "bankrupt", "outflow", "rate hike", "fine",
+    ]
+    high_impact_words = [
+        "trump", "трамп", "musk", "маск", "elon", "илон", "sec", "фрс", "fed", "etf",
+        "blackrock", "binance", "coinbase", "tether", "usdt", "hack", "взлом", "exploit",
+    ]
+
+    now = time.time()
+    score = 0.0
+    hits_pos: List[str] = []
+    hits_neg: List[str] = []
+    important: List[str] = []
+    fresh_count = weak_count = expired_count = 0
+    effective_items: List[str] = []
+    oldest_effective_age = 0.0
+    newest_effective_age: Optional[float] = None
+
+    for h in headlines[:20]:
+        low = h.lower()
+        key = normalize_news_title(h)
+        weight = 1.0
+        if item_times is not None:
+            ts = float(item_times.get(key) or 0)
+            age = max(0.0, now - ts) if ts else NEWS_EXPIRE_SECONDS + 1
+            weight = news_freshness_weight(ts, now)
+            if weight >= 1.0:
+                fresh_count += 1
+            elif weight > 0:
+                weak_count += 1
+            else:
+                expired_count += 1
+            if weight <= 0:
+                continue
+            effective_items.append(h)
+            oldest_effective_age = max(oldest_effective_age, age)
+            newest_effective_age = age if newest_effective_age is None else min(newest_effective_age, age)
+
+        p = sum(1 for w in positive_words if w in low)
+        n = sum(1 for w in negative_words if w in low)
+        hi = any(w in low for w in high_impact_words)
+        mult = 1.6 if hi else 1.0
+        score += (p - n) * mult * weight
+        if p:
+            hits_pos.append(h)
+        if n:
+            hits_neg.append(h)
+        if hi:
+            important.append(h)
+
+    score = max(-12.0, min(12.0, score))
+    delta = round(max(-6.0, min(6.0, score * 0.55)), 1)
+    if score >= 4:
+        label = "резко позитивный"
+    elif score >= 1:
+        label = "позитивный"
+    elif score <= -4:
+        label = "резко негативный"
+    elif score <= -1:
+        label = "негативный"
+    else:
+        if item_times is not None and expired_count and not (fresh_count or weak_count):
+            label = "нейтральный, свежих новостей нет"
+        else:
+            label = "нейтральный"
+
+    if item_times is None:
+        freshness_label = "без ограничения срока"
+    elif fresh_count:
+        freshness_label = f"свежие до 3ч: {fresh_count}, 3–6ч: {weak_count}"
+    elif weak_count:
+        freshness_label = f"только 3–6ч: {weak_count}, влияние 50%"
+    else:
+        freshness_label = "свежих нет, фон не учитывается"
+
+    return {
+        "value": int(round(score)),
+        "delta_pct": delta,
+        "label": label,
+        "positive_count": len(hits_pos),
+        "negative_count": len(hits_neg),
+        "important_count": len(important),
+        "important": important[:5],
+        "fresh_count": fresh_count,
+        "weak_count": weak_count,
+        "expired_count": expired_count,
+        "freshness_label": freshness_label,
+        "effective_items": effective_items[:10],
+        "newest_effective_age_sec": newest_effective_age,
+        "oldest_effective_age_sec": oldest_effective_age,
+    }
+
+def update_news_cache(force: bool = False) -> Dict[str, Any]:
+    """Обновляет новости: новые заголовки кладутся сверху, старые остаются на месте.
+    Для сигналов учитываются только новости до 6 часов: 0–3ч = 100%, 3–6ч = 50%, старше = 0%.
+    """
+    s = load_state()
+    now = time.time()
+    old_items = [str(x) for x in (s.get("news_cache") or []) if str(x).strip()]
+    old_times = dict(s.get("news_cache_times") or {})
+    fallback_ts = float(s.get("news_last_update") or 0)
+    if fallback_ts:
+        for item in old_items:
+            old_times.setdefault(normalize_news_title(item), fallback_ts)
+
+    if not force and old_items and now - float(s.get("news_last_update") or 0) < NEWS_REFRESH_SECONDS:
+        bg = analyze_news_background(old_items, old_times)
+        return {"items": old_items, "new_items": [], "item_times": old_times, **bg}
+
+    fetched = fetch_crypto_news(NEWS_CACHE_LIMIT)
+    old_norm = {normalize_news_title(x) for x in old_items}
+    new_items = [x for x in fetched if normalize_news_title(x) and normalize_news_title(x) not in old_norm]
+
+    merged: List[str] = []
+    seen = set()
+    merged_times: Dict[str, float] = {}
+    new_keys = {normalize_news_title(x) for x in new_items}
+    for item in new_items + old_items:
+        key = normalize_news_title(item)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(item)
+            merged_times[key] = now if key in new_keys else float(old_times.get(key) or now)
+        if len(merged) >= NEWS_CACHE_LIMIT:
+            break
+
+    if not merged:
+        merged = fetched[:NEWS_CACHE_LIMIT]
+        merged_times = {normalize_news_title(x): now for x in merged}
+
+    bg = analyze_news_background(merged, merged_times)
+    s["news_cache"] = merged
+    s["news_cache_times"] = merged_times
+    s["news_seen"] = list(seen)[:NEWS_CACHE_LIMIT]
+    s["news_last_update"] = now
+    s["news_bias_value"] = bg["value"]
+    s["news_bias_label"] = bg["label"]
+    s["news_bias_delta_pct"] = bg["delta_pct"]
+    save_state(s)
+    return {"items": merged, "new_items": new_items, "item_times": merged_times, **bg}
+
+def get_news_for_signal(force: bool = False) -> Dict[str, Any]:
+    """Перед сигналом реально проверяет новости, но не чаще NEWS_SIGNAL_REFRESH_SECONDS.
+    Старые новости остаются в списке, но если им больше 6 часов — не влияют на сигнал.
+    """
+    s = load_state()
+    cached = [str(x) for x in (s.get("news_cache") or []) if str(x).strip()]
+    times = dict(s.get("news_cache_times") or {})
+    fallback_ts = float(s.get("news_last_update") or 0)
+    if fallback_ts:
+        for item in cached:
+            times.setdefault(normalize_news_title(item), fallback_ts)
+    age = time.time() - float(s.get("news_last_update") or 0)
+    if force or not cached or age > NEWS_SIGNAL_REFRESH_SECONDS:
+        return update_news_cache(force=True)
+    bg = analyze_news_background(cached, times)
+    return {"items": cached, "new_items": [], "item_times": times, **bg}
+
 def news_bias(headlines: List[str]) -> int:
-    text = " ".join(headlines).lower()
-    bull = ["рост", "одобр", "etf", "bull", "rally", "surge", "adoption", "снижен", "trump", "musk", "маск", "трамп", "институцион"]
-    bear = ["взлом", "иск", "ban", "crackdown", "selloff", "ликвидац", "exploit", "rate hike", "штраф", "паден"]
-    return max(-6, min(6, sum(text.count(w) for w in bull) - sum(text.count(w) for w in bear)))
+    return int(analyze_news_background(headlines).get("value", 0))
+
+
+def format_news_panel(info: Dict[str, Any], enabled: bool) -> str:
+    delta = float(info.get("delta_pct") or 0)
+    delta_text = f"{delta:+.1f}%"
+    freshness = str(info.get("freshness_label") or "")
+    msg = (
+        f"📰 <b>Новости: {'ВКЛ' if enabled else 'ВЫКЛ'}</b>\n"
+        f"Фон: <b>{esc(info.get('label', 'нейтральный'))}</b> | влияние на сигнал: <b>{delta_text}</b>\n"
+        f"⏳ Срок действия: <b>0–3ч = 100%, 3–6ч = 50%, старше 6ч = 0%</b>\n"
+        f"Свежесть: <b>{esc(freshness)}</b>\n"
+    )
+    if enabled:
+        msg += "Фильтр новостей будет реально проверяться перед сигналом и автоторговлей.\n"
+    else:
+        msg += "Новостной фон не будет учитываться в сигналах и автоторговле.\n"
+    if info.get("new_items"):
+        msg += f"\n✅ Новые новости добавлены сверху: <b>{len(info['new_items'])}</b>\n"
+    else:
+        msg += "\nℹ️ Новых новостей нет — список не изменился.\n"
+    items = info.get("items") or []
+    msg += "\n<b>Последние новости:</b>\n"
+    msg += "\n".join("• " + esc(x) for x in items[:10]) if items else "Новости не получены."
+    return msg
 
 
 def profile_weights(profile: str) -> Dict[str, float]:
@@ -722,9 +969,13 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
     hf = features(hi)
     headlines: List[str] = []
     nb = 0
+    news_info: Dict[str, Any] = {}
     if s.get("news_enabled"):
-        headlines = fetch_crypto_news(6)
-        nb = news_bias(headlines)
+        # Перед каждым сигналом новости реально проверяются, но через кэш,
+        # чтобы при анализе 100–500 монет бот не зависал на RSS-запросах.
+        news_info = get_news_for_signal(force=False)
+        headlines = list(news_info.get("effective_items") or news_info.get("items") or [])[:6]
+        nb = int(news_info.get("value") or 0)
 
     mode = s.get("analysis_mode", "multi")
     chosen_profile = choose_profile(mode, lo, hi)
@@ -783,6 +1034,26 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
             score += 0.35
         if mode in {"best", "auto_ai", "max_profit"}:
             score += 0.2
+    news_adjustment = 0.0
+    news_label = "выкл"
+    news_delta = 0.0
+    if s.get("news_enabled"):
+        if not news_info:
+            news_info = get_news_for_signal(force=False)
+        news_delta = float(news_info.get("delta_pct") or 0.0)
+        news_label = str(news_info.get("label") or "нейтральный")
+        # Позитивный фон усиливает LONG и ослабляет SHORT; негативный — наоборот.
+        if direction == "LONG":
+            news_adjustment = news_delta
+        elif direction == "SHORT":
+            news_adjustment = -news_delta
+        else:
+            news_adjustment = -abs(news_delta) * 0.25
+        if news_adjustment > 0:
+            score += min(0.6, news_adjustment / 8.0)
+        elif news_adjustment < 0:
+            score += max(-0.8, news_adjustment / 7.0)
+
     score = round(max(1.0, min(10.0, score)), 1)
 
     # Расчётная проходимость не является гарантией.
@@ -800,6 +1071,8 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
         raw_success += 0.8
     if rr >= 1.25:
         raw_success += 1.2
+    if s.get("news_enabled"):
+        raw_success += news_adjustment
     success_pct = round(min(97.0, max(50.0, raw_success)), 1)
 
     is_super = bool(
@@ -839,6 +1112,11 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
         "higher_tf": s["higher_tf"],
         "reasons": reasons[:10],
         "headlines": headlines[:5],
+        "news_enabled": bool(s.get("news_enabled")),
+        "news_label": news_label,
+        "news_delta_pct": round(news_delta, 1),
+        "news_adjustment_pct": round(news_adjustment, 1),
+        "news_freshness_label": str(news_info.get("freshness_label", "")) if news_info else "",
         "chart_path": chart,
     }
 
@@ -912,7 +1190,14 @@ def format_signal(sig: Dict[str, Any]) -> str:
     reasons = "\n".join("• " + esc(r) for r in sig["reasons"])
     news = ""
     if sig.get("headlines"):
-        news = "\n\n📰 <b>Новости:</b>\n" + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+        adj = float(sig.get("news_adjustment_pct") or 0.0)
+        freshness = sig.get("news_freshness_label", "")
+        news = (
+            f"\n\n📰 <b>Новостной фон:</b> {esc(sig.get('news_label', 'нейтральный'))} "
+            f"| влияние на эту сделку: <b>{adj:+.1f}%</b>\n"
+            f"⏳ {esc(freshness)}\n"
+            + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+        )
     super_line = "\n🚨 <b>СУПЕР СДЕЛКА</b>" if sig.get("is_super") else ""
     return (
         f"📡 <b>Signal {esc(sig['symbol'])}</b>{super_line}\n"
@@ -942,7 +1227,8 @@ def format_signal_brief(sig: Dict[str, Any]) -> str:
     return (
         f"{emoji} <b>{esc(base)}</b>{super_mark} {sig['direction']} "
         f"L/S {sig['long_pct']}/{sig['short_pct']} | Усп. {sig.get('success_pct', 0)}% | Score {sig.get('score', 0)}/10 | "
-        f"Entry <code>{sig['entry']:.6g}</code> | SL <code>{sig['stop']:.6g}</code> | "
+        + (f"News {float(sig.get('news_adjustment_pct') or 0):+.1f}% | " if sig.get('news_enabled') else "")
+        + f"Entry <code>{sig['entry']:.6g}</code> | SL <code>{sig['stop']:.6g}</code> | "
         f"TP <code>{tp[0]:.6g}</code>/<code>{tp[1]:.6g}</code>/<code>{tp[2]:.6g}</code>"
     )
 
@@ -1112,8 +1398,21 @@ def send_signal(chat_id: int, symbol: str) -> None:
     execute_trade_if_allowed(chat_id, sig)
 
 
-def signal_sort_key(sig: Dict[str, Any]) -> Tuple[float, float, float]:
-    return (float(sig.get("is_super", False)), float(sig.get("score", 0)), float(sig.get("success_pct", 0)))
+def signal_sort_key(sig: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    # Главная сортировка — по расчётной проходимости, затем score.
+    # Так в ALL SIGNAL сверху всегда будут монеты с максимальным % успешности.
+    return (
+        float(sig.get("success_pct", 0)),
+        float(sig.get("score", 0)),
+        float(sig.get("confidence", 0)),
+        float(sig.get("is_super", False)),
+    )
+
+
+def passes_signal_threshold(sig: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> bool:
+    st = state or load_state()
+    threshold = float(st.get("signal_threshold_pct", 60))
+    return float(sig.get("success_pct", 0)) >= threshold
 
 
 def should_alert_super(sig: Dict[str, Any]) -> bool:
@@ -1147,55 +1446,85 @@ def send_all_signals_worker(chat_id: int) -> None:
     try:
         s = load_state()
         symbols = list(s.get("symbols", []))[:MAX_SIGNAL_SCAN]
+        threshold = float(s.get("signal_threshold_pct", 60))
+        mode = s.get("signal_output_mode", "all")
         if not symbols:
             safe_send_message(chat_id, "Список монет пуст. Нажми MEXC top+ / BINGX top+ или new BTC.", reply_markup=main_keyboard())
             return
-        if s.get("signal_output_mode") == "one":
-            safe_send_message(chat_id, f"⏳ Подробный анализ {len(symbols)} монет. Каждая монета отдельным сообщением. Для больших списков графики только у первых {MAX_ONE_SIGNAL_CHARTS}.", reply_markup=main_keyboard())
-            done = 0
-            for idx, sym in enumerate(symbols, 1):
-                try:
-                    with_chart = idx <= MAX_ONE_SIGNAL_CHARTS
-                    sig = build_signal(sym, with_chart)
-                    send_super_alert(chat_id, sig)
-                    if with_chart and sig.get("chart_path") and Path(sig["chart_path"]).exists():
-                        safe_send_photo(chat_id, sig["chart_path"], caption=format_signal(sig), reply_markup=main_keyboard())
-                    else:
-                        safe_send_message(chat_id, format_signal(sig), reply_markup=main_keyboard())
-                    execute_trade_if_allowed(chat_id, sig)
-                    done += 1
-                    if done % SCAN_PROGRESS_EVERY == 0:
-                        safe_send_message(chat_id, f"⏳ Подробный анализ: готово {done}/{len(symbols)}", reply_markup=main_keyboard())
-                    time.sleep(0.45)
-                except Exception as e:
-                    safe_send_message(chat_id, f"❌ {esc(sym)}: {esc(str(e)[:250])}", reply_markup=main_keyboard())
-            return
 
-        safe_send_message(chat_id, f"⏳ Краткий анализ {len(symbols)} монет запущен. Бот не зависнет: итог придёт после сканирования, лучшие setup будут сверху.", reply_markup=main_keyboard())
+        if s.get("news_enabled"):
+            info = get_news_for_signal(force=True)
+            print(f"news before scan: {info.get('label')} delta={info.get('delta_pct')} new={len(info.get('new_items') or [])}", flush=True)
+
+        scan_note = "10 лучших" if mode == "top10" else "подробно" if mode == "one" else "кратко"
+        safe_send_message(
+            chat_id,
+            f"⏳ Анализ {len(symbols)} монет запущен в фоне: {scan_note}. Фильтр: успешность от {threshold:.0f}%.",
+            reply_markup=main_keyboard(),
+        )
+
         results: List[Dict[str, Any]] = []
         errors: List[str] = []
         for i, sym in enumerate(symbols, 1):
             try:
                 sig = build_signal(sym, with_chart=False)
-                results.append(sig)
-                send_super_alert(chat_id, sig)
-                execute_trade_if_allowed(chat_id, sig)
+                if passes_signal_threshold(sig, s):
+                    results.append(sig)
+                    send_super_alert(chat_id, sig)
+                    execute_trade_if_allowed(chat_id, sig)
             except Exception as e:
                 errors.append(f"❌ <b>{esc(base_from_symbol(sym))}</b>: {esc(str(e)[:160])}")
             if i % SCAN_PROGRESS_EVERY == 0:
-                safe_send_message(chat_id, f"⏳ Сканирование: {i}/{len(symbols)}", reply_markup=main_keyboard())
+                safe_send_message(chat_id, f"⏳ Сканирование: {i}/{len(symbols)} | прошло фильтр: {len(results)}", reply_markup=main_keyboard())
 
+        # Сортируем строго по максимальной расчётной успешности, затем score.
         results.sort(key=signal_sort_key, reverse=True)
+
+        if mode == "top10":
+            results = results[:10]
+
+        if not results:
+            safe_send_message(
+                chat_id,
+                f"⚪ Нет сигналов выше порога {threshold:.0f}%. Попробуй снизить порог кнопкой 🎚 Порог или командой <code>threshold 70</code>.",
+                reply_markup=main_keyboard(),
+            )
+            if errors:
+                send_text_chunks(chat_id, "Ошибки по части монет:\n", errors[:30])
+            return
+
+        if mode == "one":
+            safe_send_message(
+                chat_id,
+                f"📨 ONE SIGNAL: подробно по {len(results)} монетам, отсортировано по успешности сверху вниз. Графики только у первых {MAX_ONE_SIGNAL_CHARTS}.",
+                reply_markup=main_keyboard(),
+            )
+            for idx, sig in enumerate(results, 1):
+                try:
+                    if idx <= MAX_ONE_SIGNAL_CHARTS:
+                        detailed = build_signal(sig["symbol"], with_chart=True)
+                        # сохраняем сортировочные поля из первого расчёта на случай небольшой разницы тиков
+                        sig = detailed
+                    if sig.get("chart_path") and Path(sig["chart_path"]).exists() and idx <= MAX_ONE_SIGNAL_CHARTS:
+                        safe_send_photo(chat_id, sig["chart_path"], caption=format_signal(sig), reply_markup=main_keyboard())
+                    else:
+                        safe_send_message(chat_id, format_signal(sig), reply_markup=main_keyboard())
+                    time.sleep(0.45)
+                except Exception as e:
+                    safe_send_message(chat_id, f"❌ {esc(sig.get('symbol'))}: {esc(str(e)[:250])}", reply_markup=main_keyboard())
+            return
+
         lines = [format_signal_brief(sig) for sig in results]
         lines.extend(errors[:50])
+        title = "10 SIGNAL" if mode == "top10" else "ALL SIGNAL"
         header = (
-            f"📡 <b>ALL SIGNAL</b> | {esc(s['exchange']).upper()} | TF {esc(s['lower_tf'])}/{esc(s['higher_tf'])} | монет: {len(symbols)}\n"
-            f"Сверху — самые выгодные по Score/расчётной проходимости.\n\n"
+            f"📡 <b>{title}</b> | {esc(s['exchange']).upper()} | TF {esc(s['lower_tf'])}/{esc(s['higher_tf'])} | "
+            f"монет: {len(symbols)} | фильтр: от {threshold:.0f}% | показано: {len(results)}\n"
+            f"Сверху — максимальная расчётная успешность, затем Score.\n\n"
         )
         send_text_chunks(chat_id, header, lines)
     finally:
         signal_jobs.pop(chat_id, None)
-
 
 
 def send_all_signals(chat_id: int) -> None:
@@ -1231,15 +1560,20 @@ def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
 
     if cmc_key:
         url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-        params = {"start": "1", "limit": str(count), "convert": "USD"}
+        params = {"start": "1", "limit": str(min(500, count + 50)), "convert": "USD"}
         headers = {"X-CMC_PRO_API_KEY": cmc_key, "Accept": "application/json"}
         r = requests.get(url, params=params, headers=headers, timeout=15)
         r.raise_for_status()
         data = r.json().get("data", [])
         out = []
-        for item in data[:count]:
+        for item in data:
+            sym = str(item.get("symbol", "?")).upper()
+            if sym in STABLE_BASES:
+                continue
             q = item.get("quote", {}).get("USD", {})
-            out.append((item.get("symbol", "?"), float(q.get("price") or 0), float(q.get("percent_change_24h") or 0)))
+            out.append((sym, float(q.get("price") or 0), float(q.get("percent_change_24h") or 0)))
+            if len(out) >= count:
+                break
         return out
 
     # Public fallback без ключа: CoinGecko. Не используем Binance, чтобы не получать 451 по региону.
@@ -1248,7 +1582,7 @@ def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": str(count),
+            "per_page": str(min(250, count + 50)),
             "page": "1",
             "sparkline": "false",
             "price_change_percentage": "24h",
@@ -1256,12 +1590,17 @@ def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         rows = []
-        for item in r.json()[:count]:
+        for item in r.json():
+            sym = str(item.get("symbol", "?")).upper()
+            if sym in STABLE_BASES:
+                continue
             rows.append((
-                str(item.get("symbol", "?")).upper(),
+                sym,
                 float(item.get("current_price") or 0),
                 float(item.get("price_change_percentage_24h") or 0),
             ))
+            if len(rows) >= count:
+                break
         if rows:
             return rows
     except Exception as e:
@@ -1274,13 +1613,11 @@ def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
     markets = ex.load_markets()
     tickers = ex.fetch_tickers()
     rows = []
-    stable_bases = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
-
     for sym, m in markets.items():
         if m.get("quote", "").upper() != "USDT" or not m.get("active", True):
             continue
         base = str(m.get("base") or sym.split("/")[0]).upper()
-        if base in stable_bases:
+        if base in STABLE_BASES:
             continue
         t = tickers.get(sym) or {}
         price = t.get("last") or t.get("close")
@@ -1328,7 +1665,7 @@ def signal_loop() -> None:
                             sig = build_signal(symbol, with_chart=False)
                             if s.get("super_trade_enabled"):
                                 send_super_alert(int(chat_id), sig)
-                            if s.get("auto_signals") and sig["direction"] != "NEUTRAL" and max(sig["long_pct"], sig["short_pct"]) >= 60:
+                            if s.get("auto_signals") and sig["direction"] != "NEUTRAL" and passes_signal_threshold(sig, s):
                                 lines.append(format_signal_brief(sig))
                                 execute_trade_if_allowed(int(chat_id), sig)
                         except Exception as e:
@@ -1528,16 +1865,17 @@ def handle(message):
         if low in {"📰 новости", "news", "/news"} or low.startswith("📰 новости"):
             s["news_enabled"] = not s.get("news_enabled", False)
             save_state(s)
-            h = fetch_crypto_news(10)
-            msg = f"📰 Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b>\n"
-            msg += "Теперь новостной фон " + ("учитывается" if s["news_enabled"] else "не учитывается") + " в сигналах.\n\n"
-            msg += "<b>Последние новости:</b>\n" + ("\n".join("• " + esc(x) for x in h) if h else "Новости не получены.")
-            bot.send_message(message.chat.id, msg, reply_markup=main_keyboard())
+            info = update_news_cache(force=True)
+            safe_send_message(message.chat.id, format_news_panel(info, s["news_enabled"]), reply_markup=main_keyboard())
             return
-        if low in {"news on", "news off"}:
-            s["news_enabled"] = low.endswith("on")
-            save_state(s)
-            bot.send_message(message.chat.id, f"Новости: {'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}", reply_markup=main_keyboard())
+        if low in {"news on", "news off", "news refresh"}:
+            if low == "news refresh":
+                pass
+            else:
+                s["news_enabled"] = low.endswith("on")
+                save_state(s)
+            info = update_news_cache(force=True)
+            safe_send_message(message.chat.id, format_news_panel(info, s["news_enabled"]), reply_markup=main_keyboard())
             return
 
         if low in {"auto on", "auto off"}:
@@ -1580,10 +1918,10 @@ def handle(message):
             bot.send_message(message.chat.id, f"🤖 Генератор анализа: <b>{nxt}</b>\nИзменение реально влияет на веса, выбор профиля, entry/TP и фильтр сделки: {explain}.", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🎯 тейк") or low == "take":
+        if low.startswith("🎯 тейк макс") or low.startswith("🎯 тейк") or low == "take":
             s["take_enabled"] = not s.get("take_enabled", True)
             save_state(s)
-            safe_send_message(message.chat.id, f"Тейк: {'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}\nДиапазон зависит от старшего TF: 1h &lt; 4h &lt; 1d &lt; 1w. Команда: take 0.5 4", reply_markup=main_keyboard())
+            safe_send_message(message.chat.id, f"Тейк макс: {'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}\nДиапазон зависит от старшего TF: 1h &lt; 4h &lt; 1d &lt; 1w. Команда: take 0.5 4", reply_markup=main_keyboard())
             return
         if low.startswith("take "):
             p = low.split()
@@ -1594,7 +1932,7 @@ def handle(message):
             s["take_max_profit_pct"] = float(p[2])
             s["take_enabled"] = True
             save_state(s)
-            bot.send_message(message.chat.id, "Тейк обновлён.", reply_markup=main_keyboard())
+            bot.send_message(message.chat.id, "Тейк макс обновлён.", reply_markup=main_keyboard())
             return
 
         if low.startswith("💼 сделки") or low == "trades":
@@ -1617,15 +1955,32 @@ def handle(message):
             bot.send_message(message.chat.id, f"Америка 16:30 МСК: {'ВКЛ' if s['session_america'] else 'ВЫКЛ'}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("📨") or low in {"all signal", "one signal"}:
+        if low.startswith("📨") or low in {"all signal", "one signal", "10 signal", "top signal", "top10 signal"}:
             if low == "all signal":
                 s["signal_output_mode"] = "all"
             elif low == "one signal":
                 s["signal_output_mode"] = "one"
+            elif low in {"10 signal", "top signal", "top10 signal"}:
+                s["signal_output_mode"] = "top10"
             else:
-                s["signal_output_mode"] = "one" if s.get("signal_output_mode") == "all" else "all"
+                cycle = ["all", "top10", "one"]
+                cur = s.get("signal_output_mode", "all")
+                s["signal_output_mode"] = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "all"
             save_state(s)
-            bot.send_message(message.chat.id, f"Режим сигналов: <b>{'all signal — кратко одним сообщением' if s['signal_output_mode']=='all' else 'one signal — подробно отдельными сообщениями'}</b>", reply_markup=main_keyboard())
+            label = {"all": "all signal — кратко одним сообщением", "one": "one signal — подробно отдельными сообщениями", "top10": "10 signal — только 10 лучших по успешности"}.get(s["signal_output_mode"], "all signal")
+            bot.send_message(message.chat.id, f"Режим сигналов: <b>{label}</b>", reply_markup=main_keyboard())
+            return
+
+        if low.startswith("🎚 порог") or low.startswith("порог") or low.startswith("threshold"):
+            mt_thr = re.search(r"(60|70|75|80|85|90|95)", low)
+            if mt_thr:
+                s["signal_threshold_pct"] = int(mt_thr.group(1))
+            else:
+                cur = int(s.get("signal_threshold_pct", 60))
+                idx = SIGNAL_THRESHOLDS.index(cur) if cur in SIGNAL_THRESHOLDS else 0
+                s["signal_threshold_pct"] = SIGNAL_THRESHOLDS[(idx + 1) % len(SIGNAL_THRESHOLDS)]
+            save_state(s)
+            bot.send_message(message.chat.id, f"🎚 Порог сигналов: <b>{s['signal_threshold_pct']}%</b>\nВ ALL/ONE/10 SIGNAL будут показаны только монеты с расчётной успешностью от этого значения.", reply_markup=main_keyboard())
             return
 
         if low.startswith("💲 цена") or low in {"price", "/price", "цена"}:
@@ -1649,6 +2004,17 @@ def handle(message):
             return
         if low in {"⛔ закрыть всё", "close all", "закрыть всё"}:
             close_all_trades(message.chat.id)
+            return
+
+        # Если в чат отправить просто название монеты — это как signal btc.
+        # Не перехватываем служебные слова и длинные фразы.
+        service_words = {
+            "price", "signal", "settings", "ping", "news", "take", "trades", "auto", "api",
+            "reset", "delete", "top", "mexc", "bingx", "threshold", "порог", "цена", "новости",
+            "сделки", "сброс", "биржа", "super", "profit", "close"
+        }
+        if re.fullmatch(r"[a-zA-Z0-9]{2,12}", text) and low not in service_words:
+            send_signal(message.chat.id, text)
             return
 
         bot.send_message(message.chat.id, "Команда не распознана. Открой /settings.", reply_markup=main_keyboard())
