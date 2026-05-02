@@ -30,7 +30,7 @@ try:
 except Exception:  # Railway всё равно поставит psutil из requirements.txt
     psutil = None
 
-VERSION = "0.06"
+VERSION = "0.08"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен")
@@ -749,20 +749,67 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
     direction = "LONG" if long_pct >= 55 else "SHORT" if short_pct >= 55 else "NEUTRAL"
     entry, stop, tp = build_entry_plan(direction, lf, s, mode)
 
-    # score 1–10: не гарантия, а внутренний рейтинг качества setup.
+    # Score 1–10: внутренний рейтинг качества setup.
+    # В v0.07 score больше не разгоняется до 10 только из-за L/S 100/0,
+    # иначе режим "Супер сделка" спамил почти по любой монете.
     sep = abs(long_pct - short_pct)
-    score = 1.0 + sep / 10
+    trend_aligned = (
+        direction == "LONG" and lf["slope"] > 0 and hf["ema20"] > hf["ema50"] and lf["ema20"] > lf["ema50"]
+    ) or (
+        direction == "SHORT" and lf["slope"] < 0 and hf["ema20"] < hf["ema50"] and lf["ema20"] < lf["ema50"]
+    )
+    momentum_aligned = (direction == "LONG" and lf["macd_hist"] > 0) or (direction == "SHORT" and lf["macd_hist"] < 0)
+    rsi_ok = (direction == "LONG" and 42 <= lf["rsi"] <= 67) or (direction == "SHORT" and 33 <= lf["rsi"] <= 58)
+    volume_confirm = lf["vol"] > lf["vol_sma"] * 1.12
+
+    risk = abs(entry - stop)
+    reward_mid = abs(tp[1] - entry) if len(tp) > 1 else abs(tp[0] - entry)
+    rr = reward_mid / risk if risk > 0 else 0.0
+    entry_distance_pct = abs(lf["price"] - entry) / max(lf["price"], 1e-12) * 100
+
+    score = 1.0 + sep / 20.0
     if direction != "NEUTRAL":
-        if (direction == "LONG" and lf["slope"] > 0 and hf["ema20"] > hf["ema50"]) or (direction == "SHORT" and lf["slope"] < 0 and hf["ema20"] < hf["ema50"]):
-            score += 1.0
-        if lf["vol"] > lf["vol_sma"] * 1.15:
-            score += 0.7
+        if trend_aligned:
+            score += 0.9
+        if momentum_aligned:
+            score += 0.55
+        if rsi_ok:
+            score += 0.45
+        if volume_confirm:
+            score += 0.45
+        if rr >= 1.25:
+            score += 0.65
+        if entry_distance_pct <= max(0.45, lf.get("atr_pct", 0.3) * 1.4):
+            score += 0.35
         if mode in {"best", "auto_ai", "max_profit"}:
-            score += 0.5
+            score += 0.2
     score = round(max(1.0, min(10.0, score)), 1)
-    # "Супер" — только сильный внутренний setup, не гарантия результата.
-    success_pct = round(min(97.0, max(50.0, confidence + max(0, score - 7) * 1.5)), 1)
-    is_super = bool(direction != "NEUTRAL" and success_pct >= 95 and score >= 7)
+
+    # Расчётная проходимость не является гарантией.
+    # Для "Супер сделки" теперь нужны одновременно:
+    # 1) LONG/SHORT, 2) проходимость 95–97%, 3) score >= 7,
+    # 4) нормальный риск/профит, 5) подтверждение трендом.
+    raw_success = confidence * 0.72 + score * 2.5
+    if trend_aligned:
+        raw_success += 2.2
+    if momentum_aligned:
+        raw_success += 1.0
+    if rsi_ok:
+        raw_success += 0.8
+    if volume_confirm:
+        raw_success += 0.8
+    if rr >= 1.25:
+        raw_success += 1.2
+    success_pct = round(min(97.0, max(50.0, raw_success)), 1)
+
+    is_super = bool(
+        direction != "NEUTRAL"
+        and 95.0 <= success_pct <= 97.0
+        and score >= 7.0
+        and confidence >= 92.0
+        and rr >= 1.25
+        and trend_aligned
+    )
 
     chart = draw_chart(symbol, lo, direction, long_pct, short_pct, entry, stop, tp) if with_chart else None
     return {
@@ -774,6 +821,8 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
         "confidence": confidence,
         "success_pct": success_pct,
         "score": score,
+        "risk_reward": round(rr, 2),
+        "entry_distance_pct": round(entry_distance_pct, 3),
         "is_super": is_super,
         "entry": entry,
         "stop": stop,
@@ -850,10 +899,11 @@ def draw_chart(symbol: str, o: Dict[str, np.ndarray], direction: str, long_pct: 
 
 
 def direction_icon(direction: str) -> str:
+    # Только цвет позиции без стрелок, чтобы не загромождать ALL SIGNAL.
     if direction == "LONG":
-        return "🟢⬆️"
+        return "🟢"
     if direction == "SHORT":
-        return "🔴⬇️"
+        return "🔴"
     return "⚪"
 
 
@@ -1170,9 +1220,15 @@ def load_top(chat_id: int, exchange_name: str, n: int) -> None:
 
 
 def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
-    """Возвращает [(symbol, price, change_pct)]. Если есть CMC_API_KEY — берёт CoinMarketCap, иначе fallback через Binance public ticker."""
+    """
+    Возвращает [(symbol, price, change_pct)].
+    1) Если есть CMC_API_KEY — берём CoinMarketCap top по market cap.
+    2) Если ключа нет — берём CoinGecko public API, чтобы не ловить Binance 451.
+    3) Если CoinGecko недоступен — fallback через выбранную биржу MEXC/BingX по quoteVolume.
+    """
     count = max(1, min(100, int(count)))
     cmc_key = os.getenv("CMC_API_KEY", "").strip()
+
     if cmc_key:
         url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
         params = {"start": "1", "limit": str(count), "convert": "USD"}
@@ -1186,29 +1242,71 @@ def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
             out.append((item.get("symbol", "?"), float(q.get("price") or 0), float(q.get("percent_change_24h") or 0)))
         return out
 
-    # Fallback без ключа: Binance 24h ticker, сортировка по quoteVolume.
-    r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
-    r.raise_for_status()
+    # Public fallback без ключа: CoinGecko. Не используем Binance, чтобы не получать 451 по региону.
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": str(count),
+            "page": "1",
+            "sparkline": "false",
+            "price_change_percentage": "24h",
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        rows = []
+        for item in r.json()[:count]:
+            rows.append((
+                str(item.get("symbol", "?")).upper(),
+                float(item.get("current_price") or 0),
+                float(item.get("price_change_percentage_24h") or 0),
+            ))
+        if rows:
+            return rows
+    except Exception as e:
+        print(f"CoinGecko price fallback error: {e}", flush=True)
+
+    # Последний fallback: выбранная биржа MEXC/BingX через ccxt.
+    s = load_state()
+    exchange_name = str(s.get("exchange", "mexc")).lower()
+    ex = make_exchange(exchange_name)
+    markets = ex.load_markets()
+    tickers = ex.fetch_tickers()
     rows = []
-    stable = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT"}
-    for t in r.json():
-        sym = t.get("symbol", "")
-        if not sym.endswith("USDT") or sym in stable:
+    stable_bases = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
+
+    for sym, m in markets.items():
+        if m.get("quote", "").upper() != "USDT" or not m.get("active", True):
             continue
+        base = str(m.get("base") or sym.split("/")[0]).upper()
+        if base in stable_bases:
+            continue
+        t = tickers.get(sym) or {}
+        price = t.get("last") or t.get("close")
+        pct = t.get("percentage")
+        vol = t.get("quoteVolume")
         try:
-            rows.append((float(t.get("quoteVolume") or 0), sym[:-4], float(t.get("lastPrice") or 0), float(t.get("priceChangePercent") or 0)))
+            price = float(price or 0)
+            pct = float(pct or 0)
+            vol = float(vol or 0)
         except Exception:
-            pass
+            continue
+        if price <= 0:
+            continue
+        rows.append((vol, base, price, pct))
+
     rows.sort(reverse=True, key=lambda x: x[0])
     return [(base, price, pct) for _, base, price, pct in rows[:count]]
 
 
 def price_text(count: int) -> str:
     rows = fetch_price_top(count)
-    lines = [f"💲 <b>Цена top-{len(rows)}</b>" + (" CoinMarketCap" if os.getenv("CMC_API_KEY") else " fallback")]
+    source = "CoinMarketCap" if os.getenv("CMC_API_KEY") else "CoinGecko/биржа"
+    lines = [f"💲 <b>Цена top-{len(rows)}</b> | {esc(source)}"]
     for base, price, pct in rows:
-        arrow = "🟢⬆️" if pct >= 0 else "🔴⬇️"
-        lines.append(f"{arrow} <b>{esc(base.lower())}</b> — <code>{price:.8g}</code> USD ({pct:+.2f}%)")
+        marker = "🟢" if pct >= 0 else "🔴"
+        lines.append(f"{marker} <b>{esc(base.lower())}</b> — <code>{price:.8g}</code> USD ({pct:+.2f}%)")
     return "\n".join(lines)
 
 
