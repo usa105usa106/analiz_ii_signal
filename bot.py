@@ -30,7 +30,7 @@ try:
 except Exception:  # Railway всё равно поставит psutil из requirements.txt
     psutil = None
 
-VERSION = "0.05"
+VERSION = "0.06"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен")
@@ -1243,6 +1243,7 @@ def signal_loop() -> None:
             print("signal_loop error", e, flush=True)
             time.sleep(30)
 
+@bot.message_handler(commands=["start", "help"])
 def start(message):
     ok, admin_msg = ensure_admin_claim(message.chat.id)
     text = (
@@ -1260,6 +1261,11 @@ def handle(message):
     low = text.lower().strip()
     s = load_state()
     try:
+        # Дублируем обработку /start внутри общего handler, чтобы Telegram/TeleBot
+        # точно назначал первого админа даже если команда попала сюда.
+        if low in {"/start", "/help"}:
+            return start(message)
+
         pending = api_input_sessions.get(message.chat.id)
         if pending:
             if low in {"cancel", "отмена", "/cancel"}:
