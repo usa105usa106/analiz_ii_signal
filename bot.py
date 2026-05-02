@@ -461,7 +461,14 @@ def signal_loop():
         except Exception as e: print('signal_loop error', e, flush=True); time.sleep(30)
 
 @bot.message_handler(commands=['start','help'])
-def start(message): bot.send_message(message.chat.id, "👋 <b>Crypto Futures Signal Bot v0.01</b>\n\nЖми 📡 Signal или отправь <code>signal BTC/USDT</code>.", reply_markup=main_keyboard())
+def start(message):
+    ok, admin_msg = ensure_admin_claim(message.chat.id)
+    text = (
+        f"{admin_msg}\n\n"
+        "👋 <b>Crypto Futures Signal Bot v0.01</b>\n\n"
+        "Жми 📡 Signal или отправь <code>signal BTC/USDT</code>."
+    )
+    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
@@ -501,7 +508,7 @@ def handle(message):
 
         # Первый /start назначает админа; остальные команды только для админа.
         if low not in {'/start', '/help'} and not is_admin(message.chat.id):
-            bot.send_message(message.chat.id, '⛔ Сначала админ должен отправить /start. Админом становится первый чат.', reply_markup=main_keyboard())
+            bot.send_message(message.chat.id, '⛔ Сначала админ должен отправить /start. Админом становится первый чат. Если ты уже нажимал /start — проверь, что на Railway загружена v004.', reply_markup=main_keyboard())
             return
         if low in {'🏓 ping','ping','/ping'}:
             st=time.perf_counter(); bot.get_me(); ms=int((time.perf_counter()-st)*1000); up=int(time.time()-start_time)

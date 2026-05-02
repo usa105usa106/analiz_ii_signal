@@ -1,49 +1,36 @@
-# Crypto Futures Signal Bot v0.01 for Railway
+# Crypto Futures Signal Bot v0.01 — Railway v004
 
-Telegram-бот для сигналов по крипто-фьючерсам: MEXC/BingX через CCXT, младший/старший таймфреймы, график, entry, stop-loss, TP1/TP2/TP3, новости, top-N, настройки, paper-autotrade.
+Исправление v004:
 
-## Важно
-Это не финансовый совет и не гарантия прибыли. Автоторговля выключена по умолчанию и работает в PAPER-режиме, пока `ALLOW_LIVE_TRADING=false`.
+- `/start` теперь реально вызывает `ensure_admin_claim(...)`;
+- первый чат, который отправит `/start`, сохраняется как `admin_id`;
+- если после деплоя всё ещё пишет «Сначала админ...», значит Railway запустил старую версию или не был сделан Redeploy.
 
-Создавай API-ключи биржи **без права вывода средств**. Не отправляй API-ключи в группы и общие чаты.
+## Деплой
 
-## Railway deploy
-1. Создай Telegram bot через BotFather.
-2. Залей репозиторий в GitHub.
-3. Railway → New Project → Deploy from GitHub.
-4. Variables: `TELEGRAM_BOT_TOKEN`.
-5. Start command: `python bot.py`.
-6. После запуска первым отправь `/start` в Telegram — этот чат станет админом.
+1. Распакуй архив.
+2. Залей файлы в GitHub.
+3. Railway → Deploy/Redeploy.
+4. В Variables добавь `TELEGRAM_BOT_TOKEN`.
+5. После запуска первым сообщением отправь боту `/start`.
 
-## Админ
-Первый пользователь/чат, который отправит `/start`, сохраняется как `admin_id` в `state.json`. Остальные чаты не смогут управлять ботом.
+Ожидаемый ответ:
 
-## API-ключи через чат
-Команды:
+```text
+✅ Ты назначен админом, потому что первым отправил /start.
+```
 
-- `api` — показать статус ключей.
-- `api mexc` — добавить/заменить API Key и API Secret MEXC.
-- `api bingx` — добавить/заменить API Key и API Secret BingX.
-- `api status` — статус.
-- `api delete mexc` — удалить ключи MEXC из chat-хранилища.
-- `api delete bingx` — удалить ключи BingX из chat-хранилища.
-- `cancel` — отменить ввод.
+Если был старый volume/state и админ уже назначен другому чату, удали файл `state.json` из Railway volume или сделай новый Railway service без старого volume.
 
-Ключи сохраняются в зашифрованный файл `api_keys.enc` в `DATA_DIR`/Railway Volume. Ключ шифрования хранится в `bot_secret.key` рядом с ним. Если удалить volume, ключи пропадут.
+API-ключи вводятся через чат:
 
-## Команды
-`signal BTC/USDT`, `mexc top-100`, `top-200`, `new SOL/USDT`, `delete SOL/USDT`, `delete all`, `exchange mexc`, `exchange bingx`, `tf 15m 1h`, `auto on/off`, `trades 10`, `take 0.5 3`, `news on/off`, `ping`.
+```text
+api mexc
+api bingx
+api status
+api delete mexc
+api delete bingx
+cancel
+```
 
-## Live trading
-Для LIVE нужны:
-
-1. `ALLOW_LIVE_TRADING=true` в Railway Variables.
-2. API-ключи через чат: `api mexc` или `api bingx`.
-3. Включить автоторговлю кнопкой `⚡ Автоторговля`.
-
-Если `ALLOW_LIVE_TRADING=false`, бот создаёт только paper trades.
-
-
-## Исправление v0.03
-
-Команда `/start` теперь реально назначает администратора: первый чат, который отправил `/start`, записывается в `state.json` как `admin_id`.
+Создавай API-ключи без права вывода средств.
