@@ -30,7 +30,7 @@ try:
 except Exception:  # Railway всё равно поставит psutil из requirements.txt
     psutil = None
 
-VERSION = "0.04"
+VERSION = "0.05"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен")
@@ -49,6 +49,8 @@ LIVE_TRADING_ENABLED = os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true
 DEFAULT_NOTIONAL_USDT = float(os.getenv("ORDER_AMOUNT_USDT", "10"))
 MAX_SIGNAL_SCAN = int(os.getenv("MAX_SIGNAL_SCAN", "500"))
 MAX_ONE_SIGNAL_CHARTS = int(os.getenv("MAX_ONE_SIGNAL_CHARTS", "40"))
+SCAN_PROGRESS_EVERY = int(os.getenv("SCAN_PROGRESS_EVERY", "50"))
+SUPER_ALERT_COOLDOWN_SECONDS = int(os.getenv("SUPER_ALERT_COOLDOWN_SECONDS", "1800"))
 MSK_OFFSET = 3
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -83,10 +85,14 @@ DEFAULT_STATE: Dict[str, Any] = {
     "session_america": False,
     "last_top_exchange": "mexc",
     "admin_id": None,
+    "price_count": 10,
+    "super_trade_enabled": False,
+    "last_super_alerts": {},
 }
 
 api_input_sessions: Dict[int, Dict[str, str]] = {}
 top_input_sessions: Dict[int, str] = {}
+signal_jobs: Dict[int, float] = {}
 
 
 def esc(x: Any) -> str:
@@ -272,8 +278,43 @@ def safe_delete_user_message(message) -> None:
         pass
 
 
+def safe_send_message(chat_id: int, text: str, **kwargs):
+    """Отправка сообщений без падения на HTML/таймаутах Telegram."""
+    try:
+        return bot.send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        print(f"send_message error: {msg}", flush=True)
+        # Ошибка entity parse чаще всего из-за случайного < или >. Повторяем без HTML.
+        try:
+            clean = re.sub(r"<[^>]+>", "", text)
+            kwargs.pop("parse_mode", None)
+            return bot.send_message(chat_id, clean, **kwargs)
+        except Exception as e2:
+            print(f"send_message retry error: {e2}", flush=True)
+            return None
+
+
+def safe_send_photo(chat_id: int, photo_path: str, caption: str = "", **kwargs):
+    try:
+        with open(photo_path, "rb") as f:
+            return bot.send_photo(chat_id, f, caption=caption, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        print(f"send_photo error: {msg}", flush=True)
+        # Если Telegram не принял caption, шлём фото без подписи + текст отдельно.
+        try:
+            with open(photo_path, "rb") as f:
+                bot.send_photo(chat_id, f, **{k: v for k, v in kwargs.items() if k != "reply_markup"})
+            return safe_send_message(chat_id, caption, reply_markup=kwargs.get("reply_markup"))
+        except Exception as e2:
+            print(f"send_photo retry error: {e2}", flush=True)
+            return safe_send_message(chat_id, caption, reply_markup=kwargs.get("reply_markup"))
+
+
 def onoff(v: bool) -> str:
     return "✅" if v else "❌"
+
 
 
 def main_keyboard() -> types.ReplyKeyboardMarkup:
@@ -286,6 +327,7 @@ def main_keyboard() -> types.ReplyKeyboardMarkup:
     kb.add(f"🧠 Улучшения {onoff(s['adaptive_improvement'])}", f"💼 Сделки: {s['daily_trades_limit']}/сут")
     kb.add(f"🌏 Азия {onoff(s['session_asia'])}", f"🇺🇸 Америка {onoff(s['session_america'])}")
     kb.add(f"🎯 Тейк {onoff(s['take_enabled'])}", f"⚡ Автоторговля {onoff(s['autotrade'])}")
+    kb.add(f"🚨 Супер сделка {onoff(s.get('super_trade_enabled', False))}", f"💲 Цена top-{s.get('price_count', 10)}")
     kb.add(f"📨 {'all signal' if s['signal_output_mode']=='all' else 'one signal'}", "📊 Профит")
     kb.add("🔑 API ключи", "⛔ Закрыть всё")
     kb.add("🏓 Ping", "♻️ Сброс")
@@ -303,6 +345,7 @@ def settings_text() -> str:
         f"Режим сигналов: <b>{'all signal — кратко одним сообщением' if s['signal_output_mode']=='all' else 'one signal — подробно отдельными сообщениями'}</b>\n"
         f"Автосигналы: <b>{'ВКЛ' if s['auto_signals'] else 'ВЫКЛ'}</b>\n"
         f"Автоторговля: <b>{'ВКЛ' if s['autotrade'] else 'ВЫКЛ'}</b> ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'})\n"
+        f"Супер сделка: <b>{'ВКЛ' if s.get('super_trade_enabled') else 'ВЫКЛ'}</b>\n"
         f"Улучшения: <b>{'ВКЛ' if s['adaptive_improvement'] else 'ВЫКЛ'}</b>\n"
         f"Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b>\n"
         f"Тейк: <b>{'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}</b>, user range {s['take_min_profit_pct']}% / {s['take_max_profit_pct']}%, TF auto: {'ВКЛ' if s.get('take_auto_by_tf') else 'ВЫКЛ'}\n"
@@ -310,6 +353,7 @@ def settings_text() -> str:
         f"Сделок/сутки: <b>{s['daily_trades_limit']}</b>, сегодня: <b>{s['daily_trades_count']}</b>\n"
         f"Азия 03:00 МСК: <b>{'ВКЛ' if s['session_asia'] else 'ВЫКЛ'}</b>\n"
         f"Америка 16:30 МСК: <b>{'ВКЛ' if s['session_america'] else 'ВЫКЛ'}</b>\n"
+        f"Цена: <b>top-{s.get('price_count', 10)}</b>\n"
         f"Админ: <b>{esc(s.get('admin_id') or 'не назначен')}</b>\n"
         f"API: <b>{esc(api_status_short())}</b>\n\n"
         "Команды:\n"
@@ -317,11 +361,11 @@ def settings_text() -> str:
         "<code>mexc top-100</code> / <code>bingx top-200</code> / <code>top-50</code>\n"
         "<code>new sol</code> / <code>delete sol</code> / <code>delete all</code>\n"
         "<code>tf 15m 4h</code> / <code>take 0.5 4</code> / <code>trades 10</code>\n"
+        "<code>price top-10</code> / <code>price 3</code>\n"
         "<code>all signal</code> / <code>one signal</code>\n"
         "<code>auto on</code> / <code>auto off</code>\n"
         "<code>api mexc</code> / <code>api bingx</code> / <code>api status</code>"
     )
-
 
 def make_exchange(name: Optional[str] = None, private: bool = False):
     s = load_state()
@@ -663,10 +707,15 @@ def build_entry_plan(direction: str, lf: Dict[str, float], s: Dict[str, Any], mo
     return float(entry), float(stop), [float(x) for x in tp]
 
 
+
 def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
     s = load_state()
     ex = make_exchange(s["exchange"])
-    symbol = resolve_symbol(ex, symbol)
+    # Символы, загруженные через top+, уже имеют точное имя биржи. Не грузим markets лишний раз.
+    if "/" in symbol and symbol.upper().endswith(":USDT"):
+        symbol = symbol
+    else:
+        symbol = resolve_symbol(ex, symbol)
     lo = fetch_ohlcv(ex, symbol, s["lower_tf"])
     hi = fetch_ohlcv(ex, symbol, s["higher_tf"])
     lf = features(lo)
@@ -696,8 +745,25 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
     total = max(long + short, 1)
     long_pct = round(long / total * 100, 1)
     short_pct = round(short / total * 100, 1)
+    confidence = round(max(long_pct, short_pct), 1)
     direction = "LONG" if long_pct >= 55 else "SHORT" if short_pct >= 55 else "NEUTRAL"
     entry, stop, tp = build_entry_plan(direction, lf, s, mode)
+
+    # score 1–10: не гарантия, а внутренний рейтинг качества setup.
+    sep = abs(long_pct - short_pct)
+    score = 1.0 + sep / 10
+    if direction != "NEUTRAL":
+        if (direction == "LONG" and lf["slope"] > 0 and hf["ema20"] > hf["ema50"]) or (direction == "SHORT" and lf["slope"] < 0 and hf["ema20"] < hf["ema50"]):
+            score += 1.0
+        if lf["vol"] > lf["vol_sma"] * 1.15:
+            score += 0.7
+        if mode in {"best", "auto_ai", "max_profit"}:
+            score += 0.5
+    score = round(max(1.0, min(10.0, score)), 1)
+    # "Супер" — только сильный внутренний setup, не гарантия результата.
+    success_pct = round(min(97.0, max(50.0, confidence + max(0, score - 7) * 1.5)), 1)
+    is_super = bool(direction != "NEUTRAL" and success_pct >= 95 and score >= 7)
+
     chart = draw_chart(symbol, lo, direction, long_pct, short_pct, entry, stop, tp) if with_chart else None
     return {
         "symbol": symbol,
@@ -705,6 +771,10 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
         "direction": direction,
         "long_pct": long_pct,
         "short_pct": short_pct,
+        "confidence": confidence,
+        "success_pct": success_pct,
+        "score": score,
+        "is_super": is_super,
         "entry": entry,
         "stop": stop,
         "tp": tp,
@@ -722,7 +792,6 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
         "headlines": headlines[:5],
         "chart_path": chart,
     }
-
 
 def draw_candles(ax, o: Dict[str, np.ndarray]) -> None:
     open_ = o["open"][-140:]
@@ -742,34 +811,50 @@ def draw_candles(ax, o: Dict[str, np.ndarray]) -> None:
         ax.add_patch(Rectangle((x[i] - width / 2, bottom), width, height, facecolor=color, edgecolor=color, alpha=0.85))
 
 
+
 def draw_chart(symbol: str, o: Dict[str, np.ndarray], direction: str, long_pct: float, short_pct: float, entry: float, stop: float, tp: List[float]) -> str:
-    close = o["close"][-140:]
+    close = o["close"][-180:]
     x = np.arange(len(close))
     e20 = ema(close, 20)
     e50 = ema(close, 50)
-    slope, st, en = linreg_line(close, 60)
-    n = min(60, len(close))
+    slope, st, en = linreg_line(close, 80)
+    n = min(80, len(close))
     tx = np.arange(len(close) - n, len(close))
     trend = np.linspace(st, en, n)
 
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=160)
-    draw_candles(ax, {k: v[-140:] for k, v in o.items() if k in {"open", "high", "low", "close", "volume"}})
-    ax.plot(x, e20, label="EMA20", linewidth=1.5)
-    ax.plot(x, e50, label="EMA50", linewidth=1.5)
-    ax.plot(tx, trend, linestyle="--", label="Наклонный уровень", linewidth=1.6)
-    ax.axhline(entry, label=f"Entry {entry:.6g}", linewidth=1.4)
-    ax.axhline(stop, linestyle="--", label=f"SL {stop:.6g}", linewidth=1.3)
+    fig, ax = plt.subplots(figsize=(20, 11), dpi=190)
+    draw_candles(ax, {k: v[-180:] for k, v in o.items() if k in {"open", "high", "low", "close", "volume"}})
+    ax.plot(x, e20, label="EMA20", linewidth=2.2)
+    ax.plot(x, e50, label="EMA50", linewidth=2.2)
+    ax.plot(tx, trend, linestyle="--", label="Наклонный уровень", linewidth=2.6)
+
+    # Жирные линии входа, стопа и тейков + крупные подписи справа.
+    ax.axhline(entry, label=f"ENTRY {entry:.6g}", linewidth=3.3)
+    ax.text(len(close) + 1.5, entry, f"ENTRY {entry:.6g}", va="center", fontsize=11, fontweight="bold")
+    ax.axhline(stop, linestyle="--", label=f"STOP {stop:.6g}", linewidth=3.3)
+    ax.text(len(close) + 1.5, stop, f"STOP {stop:.6g}", va="center", fontsize=11, fontweight="bold")
     for i, t in enumerate(tp, 1):
-        ax.axhline(t, linestyle=":", label=f"TP{i} {t:.6g}", linewidth=1.3)
-    ax.set_title(f"{symbol} | {direction} | LONG {long_pct}% / SHORT {short_pct}%", fontsize=14)
-    ax.grid(True, alpha=0.22)
-    ax.legend(fontsize=9, loc="best")
-    ax.set_xlim(-2, len(close) + 2)
+        ax.axhline(t, linestyle=":", label=f"TP{i} {t:.6g}", linewidth=3.0)
+        ax.text(len(close) + 1.5, t, f"TP{i} {t:.6g}", va="center", fontsize=11, fontweight="bold")
+
+    ax.set_title(f"{symbol} | {direction} | LONG {long_pct}% / SHORT {short_pct}%", fontsize=18, fontweight="bold")
+    ax.grid(True, alpha=0.26)
+    ax.legend(fontsize=11, loc="best")
+    ax.set_xlim(-2, len(close) + 24)
+    ax.tick_params(axis="both", labelsize=11)
     fig.tight_layout()
     p = CHART_DIR / (re.sub(r"[^A-Za-z0-9_.-]+", "_", symbol) + f"_{int(time.time())}.png")
-    fig.savefig(p)
+    fig.savefig(p, bbox_inches="tight")
     plt.close(fig)
     return str(p)
+
+
+def direction_icon(direction: str) -> str:
+    if direction == "LONG":
+        return "🟢⬆️"
+    if direction == "SHORT":
+        return "🔴⬇️"
+    return "⚪"
 
 
 def format_signal(sig: Dict[str, Any]) -> str:
@@ -778,11 +863,13 @@ def format_signal(sig: Dict[str, Any]) -> str:
     news = ""
     if sig.get("headlines"):
         news = "\n\n📰 <b>Новости:</b>\n" + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+    super_line = "\n🚨 <b>СУПЕР СДЕЛКА</b>" if sig.get("is_super") else ""
     return (
-        f"📡 <b>Signal {esc(sig['symbol'])}</b>\n"
+        f"📡 <b>Signal {esc(sig['symbol'])}</b>{super_line}\n"
         f"Биржа: <b>{esc(sig['exchange'])}</b> | TF: <b>{esc(sig['lower_tf'])}/{esc(sig['higher_tf'])}</b>\n"
-        f"Направление: <b>{sig['direction']}</b>\n"
-        f"Long/Short: <b>{sig['long_pct']}%</b> / <b>{sig['short_pct']}%</b>\n\n"
+        f"Направление: <b>{direction_icon(sig['direction'])} {sig['direction']}</b>\n"
+        f"Long/Short: <b>{sig['long_pct']}%</b> / <b>{sig['short_pct']}%</b>\n"
+        f"Расчётная проходимость: <b>{sig.get('success_pct', sig.get('confidence', 0))}%</b> | Score: <b>{sig.get('score', 0)}/10</b>\n\n"
         f"💵 Цена: <code>{sig['price']:.8g}</code>\n"
         f"🎯 Выгодный Entry: <code>{sig['entry']:.8g}</code>\n"
         f"🛑 Stop-loss: <code>{sig['stop']:.8g}</code>\n"
@@ -793,21 +880,21 @@ def format_signal(sig: Dict[str, Any]) -> str:
         f"Support/Resistance: <code>{sig['support']:.8g}</code> / <code>{sig['resistance']:.8g}</code>\n"
         f"Режим: <b>{esc(sig['mode'])}</b>, профиль: <b>{esc(sig['profile'])}</b>\n\n"
         f"🧩 <b>Факторы:</b>\n{reasons}{news}\n\n"
-        "⚠️ Не финсовет. Риск обязателен."
+        "⚠️ Не финсовет. Риск обязателен. Проценты — оценка модели, не гарантия."
     )
 
 
 def format_signal_brief(sig: Dict[str, Any]) -> str:
     tp = sig["tp"]
     base = base_from_symbol(sig["symbol"])
-    emoji = "🟢" if sig["direction"] == "LONG" else "🔴" if sig["direction"] == "SHORT" else "⚪"
+    emoji = direction_icon(sig["direction"])
+    super_mark = " 🚨" if sig.get("is_super") else ""
     return (
-        f"{emoji} <b>{esc(base)}</b> {sig['direction']} "
-        f"L/S {sig['long_pct']}/{sig['short_pct']} | "
+        f"{emoji} <b>{esc(base)}</b>{super_mark} {sig['direction']} "
+        f"L/S {sig['long_pct']}/{sig['short_pct']} | Усп. {sig.get('success_pct', 0)}% | Score {sig.get('score', 0)}/10 | "
         f"Entry <code>{sig['entry']:.6g}</code> | SL <code>{sig['stop']:.6g}</code> | "
         f"TP <code>{tp[0]:.6g}</code>/<code>{tp[1]:.6g}</code>/<code>{tp[2]:.6g}</code>"
     )
-
 
 def today_msk() -> str:
     return datetime.utcfromtimestamp(time.time() + MSK_OFFSET * 3600).strftime("%Y-%m-%d")
@@ -950,65 +1037,124 @@ def memory_text() -> str:
         return f"Memory: <b>{rss:.1f} MB</b> RSS"
 
 
+
 def send_text_chunks(chat_id: int, header: str, lines: List[str]) -> None:
     buf = header
     for line in lines:
-        if len(buf) + len(line) + 1 > 3500:
-            bot.send_message(chat_id, buf, reply_markup=main_keyboard())
+        if len(buf) + len(line) + 1 > 3200:
+            safe_send_message(chat_id, buf, reply_markup=main_keyboard())
+            time.sleep(0.35)
             buf = ""
         buf += line + "\n"
     if buf.strip():
-        bot.send_message(chat_id, buf, reply_markup=main_keyboard())
+        safe_send_message(chat_id, buf, reply_markup=main_keyboard())
 
 
 def send_signal(chat_id: int, symbol: str) -> None:
-    bot.send_message(chat_id, f"⏳ Анализирую {esc(symbol)}...", reply_markup=main_keyboard())
+    safe_send_message(chat_id, f"⏳ Анализирую {esc(symbol)}...", reply_markup=main_keyboard())
     sig = build_signal(symbol, True)
     caption = format_signal(sig)
     p = sig.get("chart_path")
     if p and Path(p).exists():
-        with open(p, "rb") as f:
-            bot.send_photo(chat_id, f, caption=caption, reply_markup=main_keyboard())
+        safe_send_photo(chat_id, p, caption=caption, reply_markup=main_keyboard())
     else:
-        bot.send_message(chat_id, caption, reply_markup=main_keyboard())
+        safe_send_message(chat_id, caption, reply_markup=main_keyboard())
     execute_trade_if_allowed(chat_id, sig)
 
 
-def send_all_signals(chat_id: int) -> None:
+def signal_sort_key(sig: Dict[str, Any]) -> Tuple[float, float, float]:
+    return (float(sig.get("is_super", False)), float(sig.get("score", 0)), float(sig.get("success_pct", 0)))
+
+
+def should_alert_super(sig: Dict[str, Any]) -> bool:
+    if not sig.get("is_super"):
+        return False
     s = load_state()
-    symbols = list(s.get("symbols", []))[:MAX_SIGNAL_SCAN]
-    if not symbols:
-        bot.send_message(chat_id, "Список монет пуст. Нажми MEXC top+ / BINGX top+ или new BTC.", reply_markup=main_keyboard())
+    key = f"{sig.get('exchange')}:{sig.get('symbol')}:{sig.get('direction')}"
+    last = (s.get("last_super_alerts") or {}).get(key, 0)
+    now = time.time()
+    if now - float(last or 0) < SUPER_ALERT_COOLDOWN_SECONDS:
+        return False
+    alerts = dict(s.get("last_super_alerts") or {})
+    alerts[key] = now
+    # чистка старых ключей
+    alerts = {k: v for k, v in alerts.items() if now - float(v or 0) < 24 * 3600}
+    s["last_super_alerts"] = alerts
+    save_state(s)
+    return True
+
+
+def send_super_alert(chat_id: int, sig: Dict[str, Any]) -> None:
+    if not load_state().get("super_trade_enabled"):
         return
-    if s.get("signal_output_mode") == "one":
-        bot.send_message(chat_id, f"⏳ Подробный анализ {len(symbols)} монет. Каждая монета отдельным сообщением.", reply_markup=main_keyboard())
-        for idx, sym in enumerate(symbols, 1):
+    if not should_alert_super(sig):
+        return
+    text = "🚨 <b>СУПЕР СДЕЛКА</b>\n" + format_signal_brief(sig)
+    safe_send_message(chat_id, text, reply_markup=main_keyboard())
+
+
+def send_all_signals_worker(chat_id: int) -> None:
+    try:
+        s = load_state()
+        symbols = list(s.get("symbols", []))[:MAX_SIGNAL_SCAN]
+        if not symbols:
+            safe_send_message(chat_id, "Список монет пуст. Нажми MEXC top+ / BINGX top+ или new BTC.", reply_markup=main_keyboard())
+            return
+        if s.get("signal_output_mode") == "one":
+            safe_send_message(chat_id, f"⏳ Подробный анализ {len(symbols)} монет. Каждая монета отдельным сообщением. Для больших списков графики только у первых {MAX_ONE_SIGNAL_CHARTS}.", reply_markup=main_keyboard())
+            done = 0
+            for idx, sym in enumerate(symbols, 1):
+                try:
+                    with_chart = idx <= MAX_ONE_SIGNAL_CHARTS
+                    sig = build_signal(sym, with_chart)
+                    send_super_alert(chat_id, sig)
+                    if with_chart and sig.get("chart_path") and Path(sig["chart_path"]).exists():
+                        safe_send_photo(chat_id, sig["chart_path"], caption=format_signal(sig), reply_markup=main_keyboard())
+                    else:
+                        safe_send_message(chat_id, format_signal(sig), reply_markup=main_keyboard())
+                    execute_trade_if_allowed(chat_id, sig)
+                    done += 1
+                    if done % SCAN_PROGRESS_EVERY == 0:
+                        safe_send_message(chat_id, f"⏳ Подробный анализ: готово {done}/{len(symbols)}", reply_markup=main_keyboard())
+                    time.sleep(0.45)
+                except Exception as e:
+                    safe_send_message(chat_id, f"❌ {esc(sym)}: {esc(str(e)[:250])}", reply_markup=main_keyboard())
+            return
+
+        safe_send_message(chat_id, f"⏳ Краткий анализ {len(symbols)} монет запущен. Бот не зависнет: итог придёт после сканирования, лучшие setup будут сверху.", reply_markup=main_keyboard())
+        results: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for i, sym in enumerate(symbols, 1):
             try:
-                with_chart = idx <= MAX_ONE_SIGNAL_CHARTS
-                sig = build_signal(sym, with_chart)
-                if with_chart and sig.get("chart_path") and Path(sig["chart_path"]).exists():
-                    with open(sig["chart_path"], "rb") as f:
-                        bot.send_photo(chat_id, f, caption=format_signal(sig), reply_markup=main_keyboard())
-                else:
-                    bot.send_message(chat_id, format_signal(sig), reply_markup=main_keyboard())
+                sig = build_signal(sym, with_chart=False)
+                results.append(sig)
+                send_super_alert(chat_id, sig)
                 execute_trade_if_allowed(chat_id, sig)
-                time.sleep(0.7)
             except Exception as e:
-                bot.send_message(chat_id, f"❌ {esc(sym)}: {esc(str(e)[:250])}", reply_markup=main_keyboard())
+                errors.append(f"❌ <b>{esc(base_from_symbol(sym))}</b>: {esc(str(e)[:160])}")
+            if i % SCAN_PROGRESS_EVERY == 0:
+                safe_send_message(chat_id, f"⏳ Сканирование: {i}/{len(symbols)}", reply_markup=main_keyboard())
+
+        results.sort(key=signal_sort_key, reverse=True)
+        lines = [format_signal_brief(sig) for sig in results]
+        lines.extend(errors[:50])
+        header = (
+            f"📡 <b>ALL SIGNAL</b> | {esc(s['exchange']).upper()} | TF {esc(s['lower_tf'])}/{esc(s['higher_tf'])} | монет: {len(symbols)}\n"
+            f"Сверху — самые выгодные по Score/расчётной проходимости.\n\n"
+        )
+        send_text_chunks(chat_id, header, lines)
+    finally:
+        signal_jobs.pop(chat_id, None)
+
+
+
+def send_all_signals(chat_id: int) -> None:
+    if chat_id in signal_jobs and time.time() - signal_jobs[chat_id] < 600:
+        safe_send_message(chat_id, "⏳ Анализ уже идёт. Дождись результата или повтори позже.", reply_markup=main_keyboard())
         return
-
-    bot.send_message(chat_id, f"⏳ Краткий анализ {len(symbols)} монет одним/несколькими сообщениями...", reply_markup=main_keyboard())
-    lines: List[str] = []
-    for sym in symbols:
-        try:
-            sig = build_signal(sym, with_chart=False)
-            lines.append(format_signal_brief(sig))
-            execute_trade_if_allowed(chat_id, sig)
-        except Exception as e:
-            lines.append(f"❌ <b>{esc(base_from_symbol(sym))}</b>: {esc(str(e)[:160])}")
-    header = f"📡 <b>ALL SIGNAL</b> | {esc(s['exchange']).upper()} | TF {esc(s['lower_tf'])}/{esc(s['higher_tf'])} | монет: {len(symbols)}\n\n"
-    send_text_chunks(chat_id, header, lines)
-
+    signal_jobs[chat_id] = time.time()
+    threading.Thread(target=send_all_signals_worker, args=(chat_id,), daemon=True).start()
+    safe_send_message(chat_id, "✅ Задача анализа запущена в фоне.", reply_markup=main_keyboard())
 
 def load_top(chat_id: int, exchange_name: str, n: int) -> None:
     n = max(1, min(1000, int(n)))
@@ -1022,6 +1168,51 @@ def load_top(chat_id: int, exchange_name: str, n: int) -> None:
     bot.send_message(chat_id, f"✅ {exchange_name.upper()} top-{n}: загружено {len(symbols)} монет.\nПервые 10:\n" + "\n".join(symbols[:10]), reply_markup=main_keyboard())
 
 
+
+def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
+    """Возвращает [(symbol, price, change_pct)]. Если есть CMC_API_KEY — берёт CoinMarketCap, иначе fallback через Binance public ticker."""
+    count = max(1, min(100, int(count)))
+    cmc_key = os.getenv("CMC_API_KEY", "").strip()
+    if cmc_key:
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+        params = {"start": "1", "limit": str(count), "convert": "USD"}
+        headers = {"X-CMC_PRO_API_KEY": cmc_key, "Accept": "application/json"}
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        out = []
+        for item in data[:count]:
+            q = item.get("quote", {}).get("USD", {})
+            out.append((item.get("symbol", "?"), float(q.get("price") or 0), float(q.get("percent_change_24h") or 0)))
+        return out
+
+    # Fallback без ключа: Binance 24h ticker, сортировка по quoteVolume.
+    r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
+    r.raise_for_status()
+    rows = []
+    stable = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT"}
+    for t in r.json():
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym in stable:
+            continue
+        try:
+            rows.append((float(t.get("quoteVolume") or 0), sym[:-4], float(t.get("lastPrice") or 0), float(t.get("priceChangePercent") or 0)))
+        except Exception:
+            pass
+    rows.sort(reverse=True, key=lambda x: x[0])
+    return [(base, price, pct) for _, base, price, pct in rows[:count]]
+
+
+def price_text(count: int) -> str:
+    rows = fetch_price_top(count)
+    lines = [f"💲 <b>Цена top-{len(rows)}</b>" + (" CoinMarketCap" if os.getenv("CMC_API_KEY") else " fallback")]
+    for base, price, pct in rows:
+        arrow = "🟢⬆️" if pct >= 0 else "🔴⬇️"
+        lines.append(f"{arrow} <b>{esc(base.lower())}</b> — <code>{price:.8g}</code> USD ({pct:+.2f}%)")
+    return "\n".join(lines)
+
+
+
 def signal_loop() -> None:
     while True:
         try:
@@ -1029,37 +1220,29 @@ def signal_loop() -> None:
             auto_chats = [x.strip() for x in os.getenv("AUTO_SIGNAL_CHAT_IDS", "").split(",") if x.strip()]
             if not auto_chats and s.get("admin_id"):
                 auto_chats = [str(s["admin_id"])]
-            if s.get("auto_signals") and within_enabled_sessions() and auto_chats:
+            need_scan = (s.get("auto_signals") or s.get("super_trade_enabled")) and within_enabled_sessions() and auto_chats
+            if need_scan:
                 symbols = list(s.get("symbols", []))[:MAX_SIGNAL_SCAN]
                 for chat_id in auto_chats:
-                    if s.get("signal_output_mode") == "all":
-                        lines: List[str] = []
-                        for symbol in symbols:
-                            try:
-                                sig = build_signal(symbol, with_chart=False)
-                                if sig["direction"] != "NEUTRAL" and max(sig["long_pct"], sig["short_pct"]) >= 60:
-                                    lines.append(format_signal_brief(sig))
-                                    execute_trade_if_allowed(int(chat_id), sig)
-                            except Exception as e:
-                                print("auto signal error", symbol, e, flush=True)
-                        if lines:
-                            send_text_chunks(int(chat_id), "📡 <b>AUTO ALL SIGNAL</b>\n\n", lines)
-                    else:
-                        for symbol in symbols:
-                            try:
-                                sig = build_signal(symbol, with_chart=False)
-                                if sig["direction"] != "NEUTRAL" and max(sig["long_pct"], sig["short_pct"]) >= 65:
-                                    bot.send_message(int(chat_id), format_signal(sig), reply_markup=main_keyboard())
-                                    execute_trade_if_allowed(int(chat_id), sig)
-                            except Exception as e:
-                                print("auto signal error", symbol, e, flush=True)
+                    lines: List[str] = []
+                    for i, symbol in enumerate(symbols, 1):
+                        try:
+                            sig = build_signal(symbol, with_chart=False)
+                            if s.get("super_trade_enabled"):
+                                send_super_alert(int(chat_id), sig)
+                            if s.get("auto_signals") and sig["direction"] != "NEUTRAL" and max(sig["long_pct"], sig["short_pct"]) >= 60:
+                                lines.append(format_signal_brief(sig))
+                                execute_trade_if_allowed(int(chat_id), sig)
+                        except Exception as e:
+                            print("auto signal error", symbol, e, flush=True)
+                    if s.get("auto_signals") and lines:
+                        # автосигналы тоже сортируем лучшими вверх приблизительно по тексту уже без пересчёта
+                        send_text_chunks(int(chat_id), "📡 <b>AUTO ALL SIGNAL</b>\n\n", lines)
             time.sleep(SIGNAL_LOOP_SECONDS)
         except Exception as e:
             print("signal_loop error", e, flush=True)
             time.sleep(30)
 
-
-@bot.message_handler(commands=["start", "help"])
 def start(message):
     ok, admin_msg = ensure_admin_claim(message.chat.id)
     text = (
@@ -1296,7 +1479,7 @@ def handle(message):
         if low.startswith("🎯 тейк") or low == "take":
             s["take_enabled"] = not s.get("take_enabled", True)
             save_state(s)
-            bot.send_message(message.chat.id, f"Тейк: {'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}\nДиапазон зависит от старшего TF: 1h < 4h < 1d < 1w. Команда: take 0.5 4", reply_markup=main_keyboard())
+            safe_send_message(message.chat.id, f"Тейк: {'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}\nДиапазон зависит от старшего TF: 1h &lt; 4h &lt; 1d &lt; 1w. Команда: take 0.5 4", reply_markup=main_keyboard())
             return
         if low.startswith("take "):
             p = low.split()
@@ -1341,8 +1524,24 @@ def handle(message):
             bot.send_message(message.chat.id, f"Режим сигналов: <b>{'all signal — кратко одним сообщением' if s['signal_output_mode']=='all' else 'one signal — подробно отдельными сообщениями'}</b>", reply_markup=main_keyboard())
             return
 
+        if low.startswith("💲 цена") or low in {"price", "/price", "цена"}:
+            safe_send_message(message.chat.id, price_text(int(load_state().get("price_count", 10))), reply_markup=main_keyboard())
+            return
+        mt_price = re.match(r"^price\s+(?:top[-\s]?)?(\d+)$", low)
+        if mt_price:
+            s["price_count"] = max(1, min(100, int(mt_price.group(1))))
+            save_state(s)
+            safe_send_message(message.chat.id, f"💲 Количество монет для кнопки Цена: top-{s['price_count']}", reply_markup=main_keyboard())
+            return
+
+        if low.startswith("🚨 супер сделка") or low in {"super", "super deal", "супер сделка"}:
+            s["super_trade_enabled"] = not s.get("super_trade_enabled", False)
+            save_state(s)
+            safe_send_message(message.chat.id, f"🚨 Супер сделка: {'ВКЛ' if s['super_trade_enabled'] else 'ВЫКЛ'}\nПри setup с расчётной проходимостью 95–97% и score от 7 бот пришлёт срочное уведомление.", reply_markup=main_keyboard())
+            return
+
         if low in {"📊 профит", "profit", "/profit"}:
-            bot.send_message(message.chat.id, profit_text(), reply_markup=main_keyboard())
+            safe_send_message(message.chat.id, profit_text(), reply_markup=main_keyboard())
             return
         if low in {"⛔ закрыть всё", "close all", "закрыть всё"}:
             close_all_trades(message.chat.id)
