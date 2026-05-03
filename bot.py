@@ -30,7 +30,7 @@ try:
 except Exception:  # Railway всё равно поставит psutil из requirements.txt
     psutil = None
 
-VERSION = "0.12"
+VERSION = "0.15"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен")
@@ -79,7 +79,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "auto_signals": False,
     "autotrade": False,
     "adaptive_improvement": False,
-    "news_enabled": False,
+    "news_enabled": True,
     "news_cache": [],
     "news_cache_times": {},
     "news_seen": [],
@@ -93,18 +93,19 @@ DEFAULT_STATE: Dict[str, Any] = {
     "take_auto_by_tf": True,
     "analysis_mode": "multi",
     "strategy_profile": "trend",
-    "signal_output_mode": "all",  # all = одно короткое сообщение, one = подробно отдельными сообщениями
+    "signal_output_mode": "top10",  # all = одно короткое сообщение, one = подробно отдельными сообщениями, top10 = 10 лучших
     "daily_trades_limit": 5,
     "daily_trades_count": 0,
     "daily_trades_date": "",
-    "session_asia": False,
-    "session_america": False,
+    "session_asia": True,
+    "session_america": True,
     "last_top_exchange": "mexc",
     "admin_id": None,
-    "price_count": 10,
+    "price_count": 5,
     "super_trade_enabled": False,
-    "signal_threshold_pct": 60,
+    "signal_threshold_pct": 90,
     "last_super_alerts": {},
+    "language": "ru",
 }
 
 api_input_sessions: Dict[int, Dict[str, str]] = {}
@@ -148,11 +149,13 @@ def save_state(state: Dict[str, Any]) -> None:
         save_json(STATE_FILE, state)
 
 
-def reset_state(preserve_admin: bool = True) -> Dict[str, Any]:
+def reset_state(preserve_admin: bool = True, preserve_language: bool = True) -> Dict[str, Any]:
     old = load_state()
     state = DEFAULT_STATE.copy()
     if preserve_admin:
         state["admin_id"] = old.get("admin_id")
+    if preserve_language:
+        state["language"] = old.get("language", DEFAULT_STATE.get("language", "ru"))
     save_state(state)
     return state
 
@@ -329,6 +332,10 @@ def safe_send_photo(chat_id: int, photo_path: str, caption: str = "", **kwargs):
             return safe_send_message(chat_id, caption, reply_markup=kwargs.get("reply_markup"))
 
 
+def is_en() -> bool:
+    return load_state().get("language") == "en"
+
+
 def onoff(v: bool) -> str:
     return "✅" if v else "❌"
 
@@ -337,55 +344,110 @@ def onoff(v: bool) -> str:
 def main_keyboard() -> types.ReplyKeyboardMarkup:
     s = load_state()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    mode_label = {"all": "all signal", "one": "one signal", "top10": "10 signal"}.get(s.get("signal_output_mode", "all"), "all signal")
-    threshold = int(s.get("signal_threshold_pct", 60))
-    kb.add("📡 Signal", "⚙️ Настройки")
-    kb.add("📈 MEXC top+", "📈 BINGX top+")
-    kb.add(f"🏦 Биржа: {s['exchange'].upper()}", f"⏱ TF {s['lower_tf']}/{s['higher_tf']}")
-    kb.add(f"📰 Новости {onoff(s['news_enabled'])}", f"🤖 Генератор: {s['analysis_mode']}")
-    kb.add(f"🧠 Улучшения {onoff(s['adaptive_improvement'])}", f"💼 Сделки: {s['daily_trades_limit']}/сут")
-    kb.add(f"🌏 Азия {onoff(s['session_asia'])}", f"🇺🇸 Америка {onoff(s['session_america'])}")
-    kb.add(f"🎯 Тейк макс {onoff(s['take_enabled'])}", f"⚡ Автоторговля {onoff(s['autotrade'])}")
-    kb.add(f"🚨 Супер сделка {onoff(s.get('super_trade_enabled', False))}", f"💲 Цена top-{s.get('price_count', 10)}")
-    kb.add(f"📨 {mode_label}", f"🎚 Порог {threshold}%")
-    kb.add("📊 Профит", "🔑 API ключи")
-    kb.add("⛔ Закрыть всё", "🏓 Ping")
-    kb.add("♻️ Сброс", "🗑 delete all")
+    mode_label = {"all": "all signal", "one": "one signal", "top10": "10 signal"}.get(s.get("signal_output_mode", "top10"), "10 signal")
+    threshold = int(s.get("signal_threshold_pct", 90))
+    lang = s.get("language", "ru")
+    if lang == "en":
+        kb.add("📡 Signal", "⚙️ Settings")
+        kb.add("📈 MEXC top+", "📈 BINGX top+")
+        kb.add(f"🏦 Exchange: {s['exchange'].upper()}", f"⏱ TF {s['lower_tf']}/{s['higher_tf']}")
+        kb.add(f"📰 News {onoff(s['news_enabled'])}", f"🤖 Generator: {s['analysis_mode']}")
+        kb.add(f"🧠 Improvement {onoff(s['adaptive_improvement'])}", f"💼 Trades: {s['daily_trades_limit']}/day")
+        kb.add(f"🌏 Asia {onoff(s['session_asia'])}", f"🇺🇸 America {onoff(s['session_america'])}")
+        kb.add(f"🎯 Max Take {onoff(s['take_enabled'])}", f"⚡ Autotrade {onoff(s['autotrade'])}")
+        kb.add(f"🚨 Super Deal {onoff(s.get('super_trade_enabled', False))}", f"💲 Price top-{s.get('price_count', 5)}")
+        kb.add(f"📨 {mode_label}", f"🎚 Threshold {threshold}%")
+        kb.add("🌐 Language EN", "📊 Profit")
+        kb.add("🔑 API keys", "⛔ Close all")
+        kb.add("🏓 Ping", "♻️ Reset")
+        kb.add("🗑 delete all")
+    else:
+        kb.add("📡 Signal", "⚙️ Настройки")
+        kb.add("📈 MEXC top+", "📈 BINGX top+")
+        kb.add(f"🏦 Биржа: {s['exchange'].upper()}", f"⏱ TF {s['lower_tf']}/{s['higher_tf']}")
+        kb.add(f"📰 Новости {onoff(s['news_enabled'])}", f"🤖 Генератор: {s['analysis_mode']}")
+        kb.add(f"🧠 Улучшения {onoff(s['adaptive_improvement'])}", f"💼 Сделки: {s['daily_trades_limit']}/сут")
+        kb.add(f"🌏 Азия {onoff(s['session_asia'])}", f"🇺🇸 Америка {onoff(s['session_america'])}")
+        kb.add(f"🎯 Тейк макс {onoff(s['take_enabled'])}", f"⚡ Автоторговля {onoff(s['autotrade'])}")
+        kb.add(f"🚨 Супер сделка {onoff(s.get('super_trade_enabled', False))}", f"💲 Цена top-{s.get('price_count', 5)}")
+        kb.add(f"📨 {mode_label}", f"🎚 Порог {threshold}%")
+        kb.add("🌐 Language", "📊 Профит")
+        kb.add("🔑 API ключи", "⛔ Закрыть всё")
+        kb.add("🏓 Ping", "♻️ Сброс")
+        kb.add("🗑 delete all")
     return kb
-
 
 def settings_text() -> str:
     s = load_state()
-    return (
-        f"⚙️ <b>Настройки v{VERSION}</b>\n"
-        f"Биржа: <b>{esc(s['exchange'])}</b>\n"
-        f"Монет: <b>{len(s['symbols'])}</b>\n"
-        f"TF: <b>{esc(s['lower_tf'])}</b> / <b>{esc(s['higher_tf'])}</b>\n"
-        f"Режим сигналов: <b>{ {'all': 'all signal — кратко одним сообщением', 'one': 'one signal — подробно отдельными сообщениями', 'top10': '10 signal — только 10 лучших'}.get(s.get('signal_output_mode', 'all')) }</b>\n"
-        f"Порог сигнала: <b>{int(s.get('signal_threshold_pct', 60))}%</b>\n"
-        f"Автосигналы: <b>{'ВКЛ' if s['auto_signals'] else 'ВЫКЛ'}</b>\n"
-        f"Автоторговля: <b>{'ВКЛ' if s['autotrade'] else 'ВЫКЛ'}</b> ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'})\n"
-        f"Супер сделка: <b>{'ВКЛ' if s.get('super_trade_enabled') else 'ВЫКЛ'}</b>\n"
-        f"Улучшения: <b>{'ВКЛ' if s['adaptive_improvement'] else 'ВЫКЛ'}</b>\n"
-        f"Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b> | фон: <b>{esc(s.get('news_bias_label', 'нейтральный'))}</b> ({float(s.get('news_bias_delta_pct') or 0):+.1f}%)\n"
-        f"Тейк: <b>{'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}</b>, user range {s['take_min_profit_pct']}% / {s['take_max_profit_pct']}%, TF auto: {'ВКЛ' if s.get('take_auto_by_tf') else 'ВЫКЛ'}\n"
-        f"Анализ: <b>{esc(s['analysis_mode'])}</b>, профиль: <b>{esc(s['strategy_profile'])}</b>\n"
-        f"Сделок/сутки: <b>{s['daily_trades_limit']}</b>, сегодня: <b>{s['daily_trades_count']}</b>\n"
-        f"Азия 03:00 МСК: <b>{'ВКЛ' if s['session_asia'] else 'ВЫКЛ'}</b>\n"
-        f"Америка 16:30 МСК: <b>{'ВКЛ' if s['session_america'] else 'ВЫКЛ'}</b>\n"
-        f"Цена: <b>top-{s.get('price_count', 10)}</b>\n"
-        f"Админ: <b>{esc(s.get('admin_id') or 'не назначен')}</b>\n"
-        f"API: <b>{esc(api_status_short())}</b>\n\n"
-        "Команды:\n"
-        "<code>signal btc</code> / <code>signal btc/usdt</code>\n"
-        "<code>mexc top-100</code> / <code>bingx top-200</code> / <code>top-50</code>\n"
-        "<code>new sol</code> / <code>delete sol</code> / <code>delete all</code>\n"
-        "<code>tf 15m 4h</code> / <code>take 0.5 4</code> / <code>trades 10</code>\n"
-        "<code>price top-10</code> / <code>price 3</code>\n"
-        "<code>all signal</code> / <code>one signal</code> / <code>10 signal</code>\n<code>threshold 70</code> / кнопка Порог\n"
-        "<code>auto on</code> / <code>auto off</code>\n"
-        "<code>api mexc</code> / <code>api bingx</code> / <code>api status</code>"
-    )
+    if s.get("language") == "en":
+        lines = [
+            f"⚙️ <b>Settings v{VERSION}</b>",
+            "Language: <b>English</b>",
+            f"Exchange: <b>{esc(s['exchange'])}</b>",
+            f"Coins: <b>{len(s['symbols'])}</b>",
+            f"TF: <b>{esc(s['lower_tf'])}</b> / <b>{esc(s['higher_tf'])}</b>",
+            f"Signal mode: <b>{ {'all': 'all signal — short summary', 'one': 'one signal — detailed separate messages', 'top10': '10 signal — only 10 best setups'}.get(s.get('signal_output_mode', 'top10')) }</b>",
+            f"Threshold: <b>{int(s.get('signal_threshold_pct', 90))}%</b>",
+            f"Auto signals: <b>{'ON' if s['auto_signals'] else 'OFF'}</b>",
+            f"Autotrade: <b>{'ON' if s['autotrade'] else 'OFF'}</b> ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'})",
+            f"Super deal: <b>{'ON' if s.get('super_trade_enabled') else 'OFF'}</b>",
+            f"Improvement: <b>{'ON' if s['adaptive_improvement'] else 'OFF'}</b>",
+            f"News: <b>{'ON' if s['news_enabled'] else 'OFF'}</b> | background: <b>{esc(s.get('news_bias_label', 'neutral'))}</b> ({float(s.get('news_bias_delta_pct') or 0):+.1f}%)",
+            f"Max Take: <b>{'ON' if s['take_enabled'] else 'OFF'}</b>, user range {s['take_min_profit_pct']}% / {s['take_max_profit_pct']}%, TF auto: {'ON' if s.get('take_auto_by_tf') else 'OFF'}",
+            f"Analysis: <b>{esc(s['analysis_mode'])}</b>, profile: <b>{esc(s['strategy_profile'])}</b>",
+            f"Trades/day: <b>{s['daily_trades_limit']}</b>, today: <b>{s['daily_trades_count']}</b>",
+            f"Asia 03:00 MSK: <b>{'ON' if s['session_asia'] else 'OFF'}</b>",
+            f"America 16:30 MSK: <b>{'ON' if s['session_america'] else 'OFF'}</b>",
+            f"Price: <b>top-{s.get('price_count', 5)}</b>",
+            f"Admin: <b>{esc(s.get('admin_id') or 'not assigned')}</b>",
+            f"API: <b>{esc(api_status_short())}</b>",
+            "",
+            "Commands:",
+            "<code>signal btc</code> / <code>btc</code>",
+            "<code>mexc top-100</code> / <code>bingx top-200</code> / <code>top-50</code>",
+            "<code>new sol</code> / <code>delete sol</code> / <code>delete all</code>",
+            "<code>tf 15m 4h</code> / <code>take 0.5 4</code> / <code>trades 10</code>",
+            "<code>price top-10</code> / <code>price 3</code>",
+            "<code>all signal</code> / <code>one signal</code> / <code>10 signal</code>",
+            "<code>threshold 70</code> / Threshold button",
+            "<code>auto on</code> / <code>auto off</code>",
+            "<code>api mexc</code> / <code>api bingx</code> / <code>api status</code>",
+        ]
+        return "\n".join(lines)
+    lines = [
+        f"⚙️ <b>Настройки v{VERSION}</b>",
+        "Язык: <b>Русский</b>",
+        f"Биржа: <b>{esc(s['exchange'])}</b>",
+        f"Монет: <b>{len(s['symbols'])}</b>",
+        f"TF: <b>{esc(s['lower_tf'])}</b> / <b>{esc(s['higher_tf'])}</b>",
+        f"Режим сигналов: <b>{ {'all': 'all signal — кратко одним сообщением', 'one': 'one signal — подробно отдельными сообщениями', 'top10': '10 signal — только 10 лучших'}.get(s.get('signal_output_mode', 'top10')) }</b>",
+        f"Порог сигнала: <b>{int(s.get('signal_threshold_pct', 90))}%</b>",
+        f"Автосигналы: <b>{'ВКЛ' if s['auto_signals'] else 'ВЫКЛ'}</b>",
+        f"Автоторговля: <b>{'ВКЛ' if s['autotrade'] else 'ВЫКЛ'}</b> ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'})",
+        f"Супер сделка: <b>{'ВКЛ' if s.get('super_trade_enabled') else 'ВЫКЛ'}</b>",
+        f"Улучшения: <b>{'ВКЛ' if s['adaptive_improvement'] else 'ВЫКЛ'}</b>",
+        f"Новости: <b>{'ВКЛ' if s['news_enabled'] else 'ВЫКЛ'}</b> | фон: <b>{esc(s.get('news_bias_label', 'нейтральный'))}</b> ({float(s.get('news_bias_delta_pct') or 0):+.1f}%)",
+        f"Тейк макс: <b>{'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}</b>, user range {s['take_min_profit_pct']}% / {s['take_max_profit_pct']}%, TF auto: {'ВКЛ' if s.get('take_auto_by_tf') else 'ВЫКЛ'}",
+        f"Анализ: <b>{esc(s['analysis_mode'])}</b>, профиль: <b>{esc(s['strategy_profile'])}</b>",
+        f"Сделок/сутки: <b>{s['daily_trades_limit']}</b>, сегодня: <b>{s['daily_trades_count']}</b>",
+        f"Азия 03:00 МСК: <b>{'ВКЛ' if s['session_asia'] else 'ВЫКЛ'}</b>",
+        f"Америка 16:30 МСК: <b>{'ВКЛ' if s['session_america'] else 'ВЫКЛ'}</b>",
+        f"Цена: <b>top-{s.get('price_count', 5)}</b>",
+        f"Админ: <b>{esc(s.get('admin_id') or 'не назначен')}</b>",
+        f"API: <b>{esc(api_status_short())}</b>",
+        "",
+        "Команды:",
+        "<code>signal btc</code> / <code>btc</code>",
+        "<code>mexc top-100</code> / <code>bingx top-200</code> / <code>top-50</code>",
+        "<code>new sol</code> / <code>delete sol</code> / <code>delete all</code>",
+        "<code>tf 15m 4h</code> / <code>take 0.5 4</code> / <code>trades 10</code>",
+        "<code>price top-10</code> / <code>price 3</code>",
+        "<code>all signal</code> / <code>one signal</code> / <code>10 signal</code>",
+        "<code>threshold 70</code> / кнопка Порог",
+        "<code>auto on</code> / <code>auto off</code>",
+        "<code>api mexc</code> / <code>api bingx</code> / <code>api status</code>",
+    ]
+    return "\n".join(lines)
 
 def make_exchange(name: Optional[str] = None, private: bool = False):
     s = load_state()
@@ -1001,7 +1063,7 @@ def build_signal(symbol: str, with_chart: bool = True) -> Dict[str, Any]:
     entry, stop, tp = build_entry_plan(direction, lf, s, mode)
 
     # Score 1–10: внутренний рейтинг качества setup.
-    # В v0.07 score больше не разгоняется до 10 только из-за L/S 100/0,
+    # В v0.15 score больше не разгоняется до 10 только из-за L/S 100/0,
     # иначе режим "Супер сделка" спамил почти по любой монете.
     sep = abs(long_pct - short_pct)
     trend_aligned = (
@@ -1188,17 +1250,45 @@ def direction_icon(direction: str) -> str:
 def format_signal(sig: Dict[str, Any]) -> str:
     tp = sig["tp"]
     reasons = "\n".join("• " + esc(r) for r in sig["reasons"])
+    lang = load_state().get("language", "ru")
     news = ""
     if sig.get("headlines"):
         adj = float(sig.get("news_adjustment_pct") or 0.0)
         freshness = sig.get("news_freshness_label", "")
-        news = (
-            f"\n\n📰 <b>Новостной фон:</b> {esc(sig.get('news_label', 'нейтральный'))} "
-            f"| влияние на эту сделку: <b>{adj:+.1f}%</b>\n"
-            f"⏳ {esc(freshness)}\n"
-            + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+        if lang == "en":
+            news = (
+                f"\n\n📰 <b>News background:</b> {esc(sig.get('news_label', 'neutral'))} "
+                f"| impact on this setup: <b>{adj:+.1f}%</b>\n"
+                f"⏳ {esc(freshness)}\n"
+                + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+            )
+        else:
+            news = (
+                f"\n\n📰 <b>Новостной фон:</b> {esc(sig.get('news_label', 'нейтральный'))} "
+                f"| влияние на эту сделку: <b>{adj:+.1f}%</b>\n"
+                f"⏳ {esc(freshness)}\n"
+                + "\n".join("• " + esc(h) for h in sig["headlines"][:4])
+            )
+    super_line = "\n🚨 <b>SUPER DEAL</b>" if (sig.get("is_super") and lang == "en") else "\n🚨 <b>СУПЕР СДЕЛКА</b>" if sig.get("is_super") else ""
+    if lang == "en":
+        return (
+            f"📡 <b>Signal {esc(sig['symbol'])}</b>{super_line}\n"
+            f"Exchange: <b>{esc(sig['exchange'])}</b> | TF: <b>{esc(sig['lower_tf'])}/{esc(sig['higher_tf'])}</b>\n"
+            f"Direction: <b>{direction_icon(sig['direction'])} {sig['direction']}</b>\n"
+            f"Long/Short: <b>{sig['long_pct']}%</b> / <b>{sig['short_pct']}%</b>\n"
+            f"Estimated success: <b>{sig.get('success_pct', sig.get('confidence', 0))}%</b> | Score: <b>{sig.get('score', 0)}/10</b>\n\n"
+            f"💵 Price: <code>{sig['price']:.8g}</code>\n"
+            f"🎯 Favorable entry: <code>{sig['entry']:.8g}</code>\n"
+            f"🛑 Stop-loss: <code>{sig['stop']:.8g}</code>\n"
+            f"✅ TP1: <code>{tp[0]:.8g}</code>\n"
+            f"✅ TP2: <code>{tp[1]:.8g}</code>\n"
+            f"✅ TP3: <code>{tp[2]:.8g}</code>\n\n"
+            f"RSI: <b>{sig['rsi']:.1f}</b> | ATR: <b>{sig['atr']:.8g}</b> ({sig['atr_pct']:.2f}%)\n"
+            f"Support/Resistance: <code>{sig['support']:.8g}</code> / <code>{sig['resistance']:.8g}</code>\n"
+            f"Mode: <b>{esc(sig['mode'])}</b>, profile: <b>{esc(sig['profile'])}</b>\n\n"
+            f"🧩 <b>Factors:</b>\n{reasons}{news}\n\n"
+            "⚠️ Not financial advice. Risk management is mandatory. Percentages are model estimates, not guarantees."
         )
-    super_line = "\n🚨 <b>СУПЕР СДЕЛКА</b>" if sig.get("is_super") else ""
     return (
         f"📡 <b>Signal {esc(sig['symbol'])}</b>{super_line}\n"
         f"Биржа: <b>{esc(sig['exchange'])}</b> | TF: <b>{esc(sig['lower_tf'])}/{esc(sig['higher_tf'])}</b>\n"
@@ -1224,6 +1314,14 @@ def format_signal_brief(sig: Dict[str, Any]) -> str:
     base = base_from_symbol(sig["symbol"])
     emoji = direction_icon(sig["direction"])
     super_mark = " 🚨" if sig.get("is_super") else ""
+    if load_state().get("language") == "en":
+        return (
+            f"{emoji} <b>{esc(base)}</b>{super_mark} {sig['direction']} "
+            f"L/S {sig['long_pct']}/{sig['short_pct']} | Success {sig.get('success_pct', 0)}% | Score {sig.get('score', 0)}/10 | "
+            + (f"News {float(sig.get('news_adjustment_pct') or 0):+.1f}% | " if sig.get('news_enabled') else "")
+            + f"Entry <code>{sig['entry']:.6g}</code> | SL <code>{sig['stop']:.6g}</code> | "
+            f"TP <code>{tp[0]:.6g}</code>/<code>{tp[1]:.6g}</code>/<code>{tp[2]:.6g}</code>"
+        )
     return (
         f"{emoji} <b>{esc(base)}</b>{super_mark} {sig['direction']} "
         f"L/S {sig['long_pct']}/{sig['short_pct']} | Усп. {sig.get('success_pct', 0)}% | Score {sig.get('score', 0)}/10 | "
@@ -1411,7 +1509,7 @@ def signal_sort_key(sig: Dict[str, Any]) -> Tuple[float, float, float, float]:
 
 def passes_signal_threshold(sig: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> bool:
     st = state or load_state()
-    threshold = float(st.get("signal_threshold_pct", 60))
+    threshold = float(st.get("signal_threshold_pct", 90))
     return float(sig.get("success_pct", 0)) >= threshold
 
 
@@ -1446,8 +1544,8 @@ def send_all_signals_worker(chat_id: int) -> None:
     try:
         s = load_state()
         symbols = list(s.get("symbols", []))[:MAX_SIGNAL_SCAN]
-        threshold = float(s.get("signal_threshold_pct", 60))
-        mode = s.get("signal_output_mode", "all")
+        threshold = float(s.get("signal_threshold_pct", 90))
+        mode = s.get("signal_output_mode", "top10")
         if not symbols:
             safe_send_message(chat_id, "Список монет пуст. Нажми MEXC top+ / BINGX top+ или new BTC.", reply_markup=main_keyboard())
             return
@@ -1537,15 +1635,67 @@ def send_all_signals(chat_id: int) -> None:
 
 def load_top(chat_id: int, exchange_name: str, n: int) -> None:
     n = max(1, min(1000, int(n)))
-    bot.send_message(chat_id, f"⏳ Загружаю top-{n} {exchange_name.upper()} futures...", reply_markup=main_keyboard())
+    lang = load_state().get("language", "ru")
+    bot.send_message(chat_id, f"⏳ Loading top-{n} {exchange_name.upper()} futures..." if lang == "en" else f"⏳ Загружаю top-{n} {exchange_name.upper()} futures...", reply_markup=main_keyboard())
     symbols = fetch_top_symbols(exchange_name, n)
     s = load_state()
     s["exchange"] = exchange_name
     s["last_top_exchange"] = exchange_name
     s["symbols"] = symbols  # если MEXC загружен — BINGX список удаляется, и наоборот
     save_state(s)
-    bot.send_message(chat_id, f"✅ {exchange_name.upper()} top-{n}: загружено {len(symbols)} монет.\nПервые 10:\n" + "\n".join(symbols[:10]), reply_markup=main_keyboard())
+    if lang == "en":
+        bot.send_message(chat_id, f"✅ {exchange_name.upper()} top-{n}: loaded {len(symbols)} coins.\nFirst 10:\n" + "\n".join(symbols[:10]), reply_markup=main_keyboard())
+    else:
+        bot.send_message(chat_id, f"✅ {exchange_name.upper()} top-{n}: загружено {len(symbols)} монет.\nПервые 10:\n" + "\n".join(symbols[:10]), reply_markup=main_keyboard())
 
+
+def reset_to_default_profile(chat_id: int) -> None:
+    old = load_state()
+    lang = old.get("language", "ru")
+    admin_id = old.get("admin_id")
+    state = DEFAULT_STATE.copy()
+    state["admin_id"] = admin_id
+    state["language"] = lang
+    state.update({
+        "exchange": "mexc",
+        "last_top_exchange": "mexc",
+        "signal_threshold_pct": 90,
+        "news_enabled": True,
+        "session_asia": True,
+        "session_america": True,
+        "price_count": 5,
+        "analysis_mode": "multi",
+        "strategy_profile": "multi",
+        "take_enabled": True,
+        "signal_output_mode": "top10",
+    })
+    save_state(state)
+    bot.send_message(
+        chat_id,
+        "♻️ Reset done. Loading MEXC top-150..." if lang == "en" else "♻️ Настройки сброшены. Загружаю MEXC top-150...",
+        reply_markup=main_keyboard(),
+    )
+    try:
+        symbols = fetch_top_symbols("mexc", 150)
+        s = load_state()
+        s["exchange"] = "mexc"
+        s["last_top_exchange"] = "mexc"
+        s["symbols"] = symbols
+        save_state(s)
+        bot.send_message(
+            chat_id,
+            f"✅ MEXC top-150 loaded: {len(symbols)} coins." if lang == "en" else f"✅ MEXC top-150 загружен: {len(symbols)} монет.",
+            reply_markup=main_keyboard(),
+        )
+    except Exception as e:
+        s = load_state()
+        s["symbols"] = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        save_state(s)
+        bot.send_message(
+            chat_id,
+            f"⚠️ Could not load MEXC top-150: {esc(str(e)[:250])}. Fallback BTC/ETH saved." if lang == "en" else f"⚠️ Не удалось загрузить MEXC top-150: {esc(str(e)[:250])}. Сохранил fallback BTC/ETH.",
+            reply_markup=main_keyboard(),
+        )
 
 
 def fetch_price_top(count: int) -> List[Tuple[str, float, float]]:
@@ -1757,7 +1907,7 @@ def handle(message):
             bot.send_message(message.chat.id, f"🏓 Ping: <b>{ms} ms</b>\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n{memory_text()}\n🔢 Version: <b>{VERSION}</b>", reply_markup=main_keyboard())
             return
 
-        if low in {"⚙️ настройки", "settings", "/settings"}:
+        if low in {"⚙️ настройки", "⚙️ settings", "settings", "/settings"}:
             bot.send_message(message.chat.id, settings_text(), reply_markup=main_keyboard())
             return
 
@@ -1781,9 +1931,18 @@ def handle(message):
             bot.send_message(message.chat.id, f"{'✅ Удалены' if existed else 'ℹ️ Не были сохранены'} ключи {exchange.upper()} из chat-хранилища.", reply_markup=main_keyboard())
             return
 
-        if low in {"♻️ сброс", "reset", "/reset"}:
-            reset_state()
-            bot.send_message(message.chat.id, "♻️ Настройки сброшены.", reply_markup=main_keyboard())
+        if low in {"♻️ сброс", "♻️ reset", "reset", "/reset"}:
+            reset_to_default_profile(message.chat.id)
+            return
+
+        if low.startswith("🌐 language") or low in {"language", "язык", "lang"}:
+            s["language"] = "ru" if s.get("language") == "en" else "en"
+            save_state(s)
+            bot.send_message(
+                message.chat.id,
+                "🌐 Language switched to English." if s["language"] == "en" else "🌐 Язык переключён на русский.",
+                reply_markup=main_keyboard(),
+            )
             return
 
         if low in {"📡 signal", "signal", "/signal"}:
@@ -1830,7 +1989,7 @@ def handle(message):
             bot.send_message(message.chat.id, f"Удалено: {before-len(s['symbols'])}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("exchange ") or low.startswith("🏦 биржа"):
+        if low.startswith("exchange ") or low.startswith("🏦 биржа") or low.startswith("🏦 exchange"):
             if low.startswith("exchange "):
                 exname = low.split(maxsplit=1)[1].strip()
                 if exname not in {"mexc", "bingx"}:
@@ -1862,7 +2021,7 @@ def handle(message):
             bot.send_message(message.chat.id, f"⏱ TF: {nxt[0]} / {nxt[1]}", reply_markup=main_keyboard())
             return
 
-        if low in {"📰 новости", "news", "/news"} or low.startswith("📰 новости"):
+        if low in {"📰 новости", "📰 news", "news", "/news"} or low.startswith("📰 новости") or low.startswith("📰 news"):
             s["news_enabled"] = not s.get("news_enabled", False)
             save_state(s)
             info = update_news_cache(force=True)
@@ -1884,7 +2043,7 @@ def handle(message):
             bot.send_message(message.chat.id, f"Автосигналы: {'ВКЛ' if s['auto_signals'] else 'ВЫКЛ'}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("⚡ автоторговля") or low in {"autotrade"}:
+        if low.startswith("⚡ автоторговля") or low.startswith("⚡ autotrade") or low in {"autotrade"}:
             s["autotrade"] = not s.get("autotrade", False)
             save_state(s)
             key, secret = get_api_credentials(s.get("exchange", "mexc"))
@@ -1892,13 +2051,13 @@ def handle(message):
             bot.send_message(message.chat.id, f"Автоторговля: {'ВКЛ' if s['autotrade'] else 'ВЫКЛ'} ({'LIVE' if LIVE_TRADING_ENABLED else 'PAPER'}){note}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🧠 улучшения") or low in {"improve"}:
+        if low.startswith("🧠 улучшения") or low.startswith("🧠 improvement") or low in {"improve", "improvement"}:
             s["adaptive_improvement"] = not s.get("adaptive_improvement", False)
             save_state(s)
             bot.send_message(message.chat.id, f"Улучшения: {'ВКЛ' if s['adaptive_improvement'] else 'ВЫКЛ'}\nЕсли последние paper-сделки в минусе, auto_ai/best будет менять профиль по мини-бэктесту.", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🤖 генератор") or low in {"generator"}:
+        if low.startswith("🤖 генератор") or low.startswith("🤖 generator") or low in {"generator"}:
             cur = s.get("analysis_mode", "multi")
             nxt = ANALYSIS_MODES[(ANALYSIS_MODES.index(cur) + 1) % len(ANALYSIS_MODES)] if cur in ANALYSIS_MODES else "multi"
             s["analysis_mode"] = nxt
@@ -1918,7 +2077,7 @@ def handle(message):
             bot.send_message(message.chat.id, f"🤖 Генератор анализа: <b>{nxt}</b>\nИзменение реально влияет на веса, выбор профиля, entry/TP и фильтр сделки: {explain}.", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🎯 тейк макс") or low.startswith("🎯 тейк") or low == "take":
+        if low.startswith("🎯 тейк макс") or low.startswith("🎯 тейк") or low.startswith("🎯 max take") or low == "take":
             s["take_enabled"] = not s.get("take_enabled", True)
             save_state(s)
             safe_send_message(message.chat.id, f"Тейк макс: {'ВКЛ' if s['take_enabled'] else 'ВЫКЛ'}\nДиапазон зависит от старшего TF: 1h &lt; 4h &lt; 1d &lt; 1w. Команда: take 0.5 4", reply_markup=main_keyboard())
@@ -1935,7 +2094,7 @@ def handle(message):
             bot.send_message(message.chat.id, "Тейк макс обновлён.", reply_markup=main_keyboard())
             return
 
-        if low.startswith("💼 сделки") or low == "trades":
+        if low.startswith("💼 сделки") or low.startswith("💼 trades") or low == "trades":
             bot.send_message(message.chat.id, f"💼 Лимит сделок: <b>{s['daily_trades_limit']}</b> в сутки.\nФормат: <code>trades 10</code>", reply_markup=main_keyboard())
             return
         if low.startswith("trades "):
@@ -1944,12 +2103,12 @@ def handle(message):
             bot.send_message(message.chat.id, f"Сделок/сутки: {s['daily_trades_limit']}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🌏 азия") or low == "asia":
+        if low.startswith("🌏 азия") or low.startswith("🌏 asia") or low == "asia":
             s["session_asia"] = not s.get("session_asia", False)
             save_state(s)
             bot.send_message(message.chat.id, f"Азия 03:00 МСК: {'ВКЛ' if s['session_asia'] else 'ВЫКЛ'}", reply_markup=main_keyboard())
             return
-        if low.startswith("🇺🇸 америка") or low == "america":
+        if low.startswith("🇺🇸 америка") or low.startswith("🇺🇸 america") or low == "america":
             s["session_america"] = not s.get("session_america", False)
             save_state(s)
             bot.send_message(message.chat.id, f"Америка 16:30 МСК: {'ВКЛ' if s['session_america'] else 'ВЫКЛ'}", reply_markup=main_keyboard())
@@ -1964,27 +2123,27 @@ def handle(message):
                 s["signal_output_mode"] = "top10"
             else:
                 cycle = ["all", "top10", "one"]
-                cur = s.get("signal_output_mode", "all")
-                s["signal_output_mode"] = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "all"
+                cur = s.get("signal_output_mode", "top10")
+                s["signal_output_mode"] = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "top10"
             save_state(s)
             label = {"all": "all signal — кратко одним сообщением", "one": "one signal — подробно отдельными сообщениями", "top10": "10 signal — только 10 лучших по успешности"}.get(s["signal_output_mode"], "all signal")
             bot.send_message(message.chat.id, f"Режим сигналов: <b>{label}</b>", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🎚 порог") or low.startswith("порог") or low.startswith("threshold"):
+        if low.startswith("🎚 порог") or low.startswith("🎚 threshold") or low.startswith("порог") or low.startswith("threshold"):
             mt_thr = re.search(r"(60|70|75|80|85|90|95)", low)
             if mt_thr:
                 s["signal_threshold_pct"] = int(mt_thr.group(1))
             else:
-                cur = int(s.get("signal_threshold_pct", 60))
+                cur = int(s.get("signal_threshold_pct", 90))
                 idx = SIGNAL_THRESHOLDS.index(cur) if cur in SIGNAL_THRESHOLDS else 0
                 s["signal_threshold_pct"] = SIGNAL_THRESHOLDS[(idx + 1) % len(SIGNAL_THRESHOLDS)]
             save_state(s)
             bot.send_message(message.chat.id, f"🎚 Порог сигналов: <b>{s['signal_threshold_pct']}%</b>\nВ ALL/ONE/10 SIGNAL будут показаны только монеты с расчётной успешностью от этого значения.", reply_markup=main_keyboard())
             return
 
-        if low.startswith("💲 цена") or low in {"price", "/price", "цена"}:
-            safe_send_message(message.chat.id, price_text(int(load_state().get("price_count", 10))), reply_markup=main_keyboard())
+        if low.startswith("💲 цена") or low.startswith("💲 price") or low in {"price", "/price", "цена"}:
+            safe_send_message(message.chat.id, price_text(int(load_state().get("price_count", 5))), reply_markup=main_keyboard())
             return
         mt_price = re.match(r"^price\s+(?:top[-\s]?)?(\d+)$", low)
         if mt_price:
@@ -1993,16 +2152,16 @@ def handle(message):
             safe_send_message(message.chat.id, f"💲 Количество монет для кнопки Цена: top-{s['price_count']}", reply_markup=main_keyboard())
             return
 
-        if low.startswith("🚨 супер сделка") or low in {"super", "super deal", "супер сделка"}:
+        if low.startswith("🚨 супер сделка") or low.startswith("🚨 super deal") or low in {"super", "super deal", "супер сделка"}:
             s["super_trade_enabled"] = not s.get("super_trade_enabled", False)
             save_state(s)
             safe_send_message(message.chat.id, f"🚨 Супер сделка: {'ВКЛ' if s['super_trade_enabled'] else 'ВЫКЛ'}\nПри setup с расчётной проходимостью 95–97% и score от 7 бот пришлёт срочное уведомление.", reply_markup=main_keyboard())
             return
 
-        if low in {"📊 профит", "profit", "/profit"}:
+        if low in {"📊 профит", "📊 profit", "profit", "/profit"}:
             safe_send_message(message.chat.id, profit_text(), reply_markup=main_keyboard())
             return
-        if low in {"⛔ закрыть всё", "close all", "закрыть всё"}:
+        if low in {"⛔ закрыть всё", "⛔ close all", "close all", "закрыть всё"}:
             close_all_trades(message.chat.id)
             return
 
@@ -2011,7 +2170,7 @@ def handle(message):
         service_words = {
             "price", "signal", "settings", "ping", "news", "take", "trades", "auto", "api",
             "reset", "delete", "top", "mexc", "bingx", "threshold", "порог", "цена", "новости",
-            "сделки", "сброс", "биржа", "super", "profit", "close"
+            "сделки", "сброс", "биржа", "super", "profit", "close", "language", "lang", "язык"
         }
         if re.fullmatch(r"[a-zA-Z0-9]{2,12}", text) and low not in service_words:
             send_signal(message.chat.id, text)
