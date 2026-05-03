@@ -1,5 +1,5 @@
-THRESHOLD_VALUES = [60, 70, 75, 80, 85, 90, 95]
 from __future__ import annotations
+THRESHOLD_VALUES = [60, 70, 75, 80, 85, 90, 95]
 
 import base64
 import hashlib
